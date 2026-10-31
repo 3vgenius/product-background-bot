@@ -394,7 +394,7 @@ def clean_env(monkeypatch, tmp_path):
         [{"id": 7, "path": "backgrounds/7_marble.jpg", "name": "Мрамор"}], local
     )
     monkeypatch.setattr(config, "GITHUB_TOKEN", "T")
-    monkeypatch.setattr(config, "INPAINT_BACKEND", "opencv")
+    monkeypatch.setattr(config, "INPAINT_BACKEND", "auto")
     monkeypatch.setattr(store, "GithubStore", lambda **kw: local)
 
     state = {"mask_box": (380, 120, 499, 279)}
@@ -445,7 +445,7 @@ def test_clean_task_stores_cleaned_copy_and_keeps_original(clean_env, stub_photo
     msg = stub_photo[-1]
     assert msg["chat_id"] == "555"
     assert "очищен" in msg["caption"] and "Мрамор" in msg["caption"]
-    assert "OpenCV" in msg["caption"]
+    assert "фрагментами фона" in msg["caption"]
     assert msg["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "bgorig:7"
     assert Image.open(io.BytesIO(msg["photo"])).format == "JPEG"
 

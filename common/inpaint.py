@@ -166,23 +166,63 @@ def inpaint_opencv(image: Image.Image, mask: Image.Image, radius: int = 7) -> Im
     return Image.fromarray(cv2.cvtColor(filled, cv2.COLOR_BGR2RGB), "RGB")
 
 
+def inpaint_shiftmap(image: Image.Image, mask: Image.Image) -> Image.Image:
+    """Patch-based (exemplar) inpainting from opencv-contrib: fills the hole by
+    copying real patches of the same picture, so textures (grass, fabric,
+    wood, concrete) stay sharp instead of turning into a smear. This is what
+    "content-aware fill" does. Slower than Telea (~15 s per 2 MP with a
+    half-frame hole) but it is the only CPU method here that does not leave
+    a visible blot on a large hole."""
+    import cv2
+    import numpy as np
+
+    if not hasattr(cv2, "xphoto"):
+        raise RuntimeError("opencv-contrib (cv2.xphoto) is not installed")
+    rgb = np.asarray(image.convert("RGB"))
+    hole = np.asarray(mask.convert("L")) >= 128
+    # xphoto's convention is inverted: non-zero = keep, zero = fill.
+    keep = (~hole).astype(np.uint8) * 255
+    bgr = np.ascontiguousarray(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    filled = np.zeros_like(bgr)
+    cv2.xphoto.inpaint(bgr, keep, filled, cv2.xphoto.INPAINT_SHIFTMAP)
+    out = cv2.cvtColor(filled, cv2.COLOR_BGR2RGB)
+    out[~hole] = rgb[~hole]  # keep untouched pixels bit-identical
+    return Image.fromarray(out, "RGB")
+
+
+# Backend chain. "auto" tries the exemplar method first: it is proven here on
+# large holes over texture, needs no download and no network. LaMa is opt-in
+# (INPAINT_BACKEND=lama) until it has been seen working on the runner. Telea
+# is the last resort so that the user always gets *something* plus an honest
+# label in the caption.
+_CHAIN = {
+    "auto": ("shiftmap", "opencv"),
+    "shiftmap": ("shiftmap",),
+    "lama": ("lama",),
+    "opencv": ("opencv",),
+    "lama-auto": ("lama", "shiftmap", "opencv"),
+}
+_ENGINES = {"lama": inpaint_lama, "shiftmap": inpaint_shiftmap, "opencv": inpaint_opencv}
+
+
 def inpaint(image: Image.Image, mask: Image.Image, backend: str = "auto") -> tuple[Image.Image, str]:
     """Return (filled image, backend actually used)."""
-    backend = (backend or "auto").lower()
-    if backend in ("auto", "lama"):
+    chain = _CHAIN.get((backend or "auto").lower())
+    if chain is None:
+        raise ValueError(f"unknown INPAINT_BACKEND {backend!r}; use one of {sorted(_CHAIN)}")
+    last_error: Exception | None = None
+    for name in chain:
         try:
             started = time.monotonic()
-            result = inpaint_lama(image, mask)
-            log.info("lama inpaint in %.1fs", time.monotonic() - started)
-            return result, "lama"
+            result = _ENGINES[name](image, mask)
+            log.info("%s inpaint in %.1fs", name, time.monotonic() - started)
+            return result, name
         except Exception as exc:  # noqa: BLE001 - degrade, do not break
-            if backend == "lama":
+            last_error = exc
+            if name == chain[-1]:
                 raise
-            log.warning("LaMa unavailable (%s), falling back to OpenCV", exc)
-    started = time.monotonic()
-    result = inpaint_opencv(image, mask)
-    log.info("opencv inpaint in %.1fs", time.monotonic() - started)
-    return result, "opencv"
+            log.warning("%s unavailable (%s), falling back to %s", name, exc, chain[chain.index(name) + 1])
+    raise RuntimeError(str(last_error))  # pragma: no cover - loop always returns or raises
 
 
 # --- 3. the whole thing ------------------------------------------------------

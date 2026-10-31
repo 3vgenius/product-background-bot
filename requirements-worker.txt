@@ -4,7 +4,8 @@
 rembg[cpu]>=2.0.61,<3
 Pillow>=10.4,<14
 requests>=2.32,<3
-# Background cleaning: OpenCV is the always-available inpainting fallback;
-# LaMa runs on the onnxruntime that rembg already brings.
-opencv-python-headless>=4.9,<5
+# Background cleaning: opencv-contrib brings cv2.xphoto.inpaint (ShiftMap,
+# patch-based fill) - the main engine - and Telea as the last resort. LaMa
+# (opt-in) runs on the onnxruntime that rembg already brings.
+opencv-contrib-python-headless>=4.9,<6
 numpy>=1.26,<3
