@@ -153,7 +153,29 @@ def main(argv: list[str] | None = None) -> int:
         _notify_failure(args.chat_id, "обработал, но не смог отправить результат в чат")
         return 1
     log.info("sent to chat %s", args.chat_id)
+    if args.oneoff_file_id:
+        _forget_oneoff(args.user_id, args.oneoff_file_id)
     return 0
+
+
+def _forget_oneoff(user_id: str, file_id: str) -> None:
+    """The result is already in the chat; a failure here must not fail the
+    job. Worst case the next product photo reuses the one-off once more."""
+    from common import config, store
+
+    if not user_id or not config.GITHUB_TOKEN:
+        log.warning("cannot clear one-off: no user id or no GITHUB_TOKEN")
+        return
+    try:
+        # prefer_local=False: the Actions checkout is minutes old; settings
+        # must be read fresh so a model/size change made meanwhile survives.
+        github = store.GithubStore(prefer_local=False)
+        if store.clear_oneoff_if_matches(int(user_id), file_id, github):
+            log.info("one-off background cleared for user %s", user_id)
+        else:
+            log.info("one-off already replaced or cleared for user %s", user_id)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not clear one-off for user %s: %s", user_id, exc)
 
 
 def _notify_failure(chat_id: str, text: str) -> None:

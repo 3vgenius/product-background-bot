@@ -306,7 +306,10 @@ def test_picks_the_largest_photo_from_an_album(env):
     assert env["dispatched"][0]["file_id"] == "PROD"  # 50000 bytes, not "small"
 
 
-def test_oneoff_background_wins_and_is_consumed(env):
+def test_oneoff_background_wins_and_survives_until_delivered(env):
+    """The one-off is cleared by the worker after a successful delivery, not
+    here: if the job never starts (runner budget, outage) or fails, the user
+    re-sends the product photo instead of re-uploading the background."""
     items = store.list_backgrounds()
     items.append({"id": 1, "name": "Фон", "path": "backgrounds/1.png"})
     store.save_backgrounds(items)
@@ -317,7 +320,7 @@ def test_oneoff_background_wins_and_is_consumed(env):
     job = env["dispatched"][0]
     assert job["oneoff_file_id"] == "ONEOFF_BG"
     assert job["background"] == ""
-    assert store.user_settings(ALLOWED, store.load_settings())["oneoff"] is None
+    assert store.user_settings(ALLOWED, store.load_settings())["oneoff"] == "ONEOFF_BG"
 
 
 def test_pending_once_then_product_photo(env):

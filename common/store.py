@@ -361,3 +361,20 @@ def update_user(user_id: int, patch: dict, store: LocalStore | None = None) -> d
     entry.update(patch)
     save_settings(settings, store, f"settings: user {user_id}")
     return entry
+
+
+def clear_oneoff_if_matches(user_id: int, file_id: str, store: LocalStore | None = None) -> bool:
+    """Forget the user's one-off background, but only if it is still ``file_id``.
+
+    Called by the worker after a successful delivery. The user may already have
+    set a *new* one-off while the job was running; that one must survive.
+    Reads through the API (never the Actions checkout, which is minutes old).
+    """
+    store = store or get_store()
+    settings = load_settings(store)
+    entry = user_settings(user_id, settings)
+    if entry.get("oneoff") != file_id:
+        return False
+    entry["oneoff"] = None
+    save_settings(settings, store, message=f"one-off background used by {user_id}")
+    return True

@@ -319,12 +319,11 @@ def process_product(chat_id: int, user_id: int, file_id: str) -> None:
         )
         return
 
-    # A one-off background is consumed as soon as the job is queued.
-    if oneoff_file_id:
-        store.save_settings(
-            {**settings, "users": {**settings["users"], str(user_id): {**entry, "oneoff": None}}},
-            message="one-off background consumed",
-        )
+    # The one-off background is NOT consumed here. The worker clears it after
+    # it has actually delivered a result; if the job never starts (runner
+    # budget exhausted, GitHub outage) or fails, the user simply sends the
+    # product photo again instead of re-uploading the background. The price
+    # is that two photos sent within the same minute both get the one-off.
     tg.send_message(chat_id, PROCESSING_TEXT)
 
 

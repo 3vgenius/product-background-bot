@@ -272,3 +272,80 @@ def test_parse_args_defaults():
 def test_parse_args_requires_chat_and_file():
     with pytest.raises(SystemExit):
         worker.parse_args(["--chat-id", "1"])
+
+
+# --- one-off bookkeeping after delivery ------------------------------------
+
+
+@pytest.fixture()
+def settings_store(tmp_path, monkeypatch):
+    """worker._forget_oneoff builds a GithubStore(prefer_local=False); swap in
+    a LocalStore rooted at tmp_path so the read-modify-write is real."""
+    from common import config, store
+
+    monkeypatch.setattr(config, "GITHUB_TOKEN", "T")
+    local = store.LocalStore(tmp_path)
+    monkeypatch.setattr(store, "GithubStore", lambda **kw: local)
+    return local
+
+
+def test_worker_clears_oneoff_after_successful_delivery(
+    tmp_path, monkeypatch, fake_rembg, stub_telegram, settings_store
+):
+    from common import store
+
+    store.update_user(111, {"oneoff": "ONEOFF_BG", "model": "isnet-general-use"}, settings_store)
+    assert worker.main(_argv(tmp_path, None, oneoff_file_id="ONEOFF_BG")) == 0
+    assert stub_telegram[-1]["filename"] == "product.jpg"
+    assert store.user_settings(111, store.load_settings(settings_store))["oneoff"] is None
+
+
+def test_worker_keeps_a_newer_oneoff_set_meanwhile(
+    tmp_path, monkeypatch, fake_rembg, stub_telegram, settings_store
+):
+    from common import store
+
+    # While this job ran, the user already registered a different one-off.
+    store.update_user(111, {"oneoff": "NEWER_BG"}, settings_store)
+    assert worker.main(_argv(tmp_path, None, oneoff_file_id="ONEOFF_BG")) == 0
+    assert store.user_settings(111, store.load_settings(settings_store))["oneoff"] == "NEWER_BG"
+
+
+def test_worker_does_not_clear_oneoff_when_delivery_failed(
+    tmp_path, monkeypatch, fake_rembg, stub_telegram, settings_store
+):
+    from common import store
+
+    def boom(*a, **k):
+        raise tg.TelegramError("sendDocument", 500, "down")
+
+    monkeypatch.setattr(tg, "send_document", boom)
+    store.update_user(111, {"oneoff": "ONEOFF_BG"}, settings_store)
+    assert worker.main(_argv(tmp_path, None, oneoff_file_id="ONEOFF_BG")) == 1
+    assert store.user_settings(111, store.load_settings(settings_store))["oneoff"] == "ONEOFF_BG"
+
+
+def test_worker_bookkeeping_failure_does_not_fail_the_job(
+    tmp_path, monkeypatch, fake_rembg, stub_telegram
+):
+    from common import config, store
+
+    monkeypatch.setattr(config, "GITHUB_TOKEN", "T")
+
+    def boom(**kw):
+        raise store.StoreError("PUT settings.json: HTTP 500")
+
+    monkeypatch.setattr(store, "GithubStore", boom)
+    # The result was delivered; a failed clean-up must not turn that into a red run.
+    assert worker.main(_argv(tmp_path, None, oneoff_file_id="ONEOFF_BG")) == 0
+    assert stub_telegram[-1]["filename"] == "product.jpg"
+
+
+def test_worker_skips_bookkeeping_without_token(tmp_path, monkeypatch, fake_rembg, stub_telegram):
+    from common import config, store
+
+    monkeypatch.setattr(config, "GITHUB_TOKEN", "")
+    calls = []
+    monkeypatch.setattr(store, "GithubStore", lambda **kw: calls.append(kw))
+    assert worker.main(_argv(tmp_path, None, oneoff_file_id="ONEOFF_BG")) == 0
+    assert calls == []

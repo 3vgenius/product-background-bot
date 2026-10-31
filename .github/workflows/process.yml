@@ -53,10 +53,15 @@ concurrency:
   group: background-${{ github.event.inputs.chat_id }}
   cancel-in-progress: false
 
+# contents: write is needed for exactly one thing: after a successful delivery
+# the worker clears the user's one-off background in settings.json.
+permissions:
+  contents: write
+
 jobs:
   replace:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -86,6 +91,8 @@ jobs:
       - name: Replace background
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO: ${{ github.repository }}
           # 2 threads matches the runner's vCPU count; more threads on 2 cores
           # just adds contention.
           OMP_NUM_THREADS: '2'
