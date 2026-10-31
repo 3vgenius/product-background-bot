@@ -3,7 +3,7 @@
     "1314348241": {
       "background_id": null,
       "model": "birefnet-general",
-      "size": 1024,
+      "size": 1600,
       "pending": null,
       "oneoff": null,
       "pending_name": ""
