@@ -244,7 +244,10 @@ def clean_main(args: argparse.Namespace) -> int:
         return 1
 
     elapsed = int(time.monotonic() - started)
-    engine = "нейросеть LaMa" if backend == "lama" else "OpenCV (запасной алгоритм)"
+    engine = {
+        "shiftmap": "заполнение фрагментами фона",
+        "lama": "нейросеть LaMa",
+    }.get(backend, "OpenCV (запасной алгоритм, возможна размытость)")
     caption = (
         f"🧹 Фон №{item['id']} «{item['name']}» очищен за {elapsed} с.\n"
         f"Заполнено {filled:.0%} кадра · {engine}.\n"

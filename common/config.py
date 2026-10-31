@@ -118,9 +118,9 @@ DEFAULT_SIZE = int(_clean(os.getenv("OUTPUT_SIZE")) or 1024)
 DEFAULT_FILL = float(_clean(os.getenv("OBJECT_FILL")) or 0.8)
 BACKGROUND_JPEG_QUALITY = 90
 
-# Background cleaning (object removal). LaMa ONNX export; downloaded once on
-# the Actions runner and kept in the model cache. INPAINT_BACKEND: auto (LaMa,
-# falling back to OpenCV), lama, or opencv.
+# Background cleaning (object removal). INPAINT_BACKEND: auto (patch-based
+# ShiftMap, falling back to Telea), shiftmap, opencv, lama (ONNX export below,
+# downloaded once into the model cache; opt-in) or lama-auto.
 LAMA_ONNX_URL = _clean(os.getenv("LAMA_ONNX_URL")) or (
     "https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx"
 )
