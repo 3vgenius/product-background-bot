@@ -818,3 +818,37 @@ def test_background_name_is_one_clean_line(env, fake_download):
     assert name == 'Лето "у моря" 2026'
     _post(env["client"], _photo(file_id="PRODUCT"))
     assert env["dispatched"][0]["label"] == 'Лето "у моря" 2026'
+
+
+def test_command_menu_matches_the_handled_commands():
+    """Every menu entry must be a command the bot actually handles, and every
+    documented command must be in the menu (except /start, which Telegram
+    shows on its own)."""
+    from common.updates import BOT_COMMANDS, HELP_TEXT
+
+    menu = {c["command"] for c in BOT_COMMANDS}
+    assert menu == {"bg", "backgrounds", "once", "settings", "cancel", "help"}
+    for c in BOT_COMMANDS:
+        assert 1 <= len(c["description"]) <= 256
+        assert c["command"] == c["command"].lower()
+    for cmd in ("/bg", "/backgrounds", "/once", "/settings", "/cancel"):
+        assert cmd in HELP_TEXT
+
+
+def test_help_mentions_new_behaviour():
+    from common.updates import HELP_TEXT
+
+    assert "затем пришлите картинку" in HELP_TEXT
+    assert "🗑" in HELP_TEXT and "подтверждением" in HELP_TEXT
+    assert "ещё раз" in HELP_TEXT  # /once survives a failed job
+    assert "Быстро" in HELP_TEXT and "Качество" in HELP_TEXT
+
+
+def test_register_commands_failure_is_not_fatal(monkeypatch):
+    import app as app_module
+
+    def boom(commands):
+        raise tg.TelegramError("setMyCommands", 0, "transport failure")
+
+    monkeypatch.setattr(tg, "set_my_commands", boom)
+    app_module._register_commands()  # must not raise

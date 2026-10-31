@@ -274,3 +274,17 @@ def test_edit_message_other_caption_errors_still_raise(monkeypatch):
     monkeypatch.setattr(tg.requests, "post", fake_post)
     with pytest.raises(tg.TelegramError):
         tg.edit_message(1, 2, "x")
+
+
+def test_set_my_commands_posts_the_menu(monkeypatch):
+    posted = {}
+
+    def fake_post(url, **kwargs):
+        posted["method"] = url.rsplit("/", 1)[-1]
+        posted["json"] = kwargs.get("json")
+        return FakeResponse()
+
+    monkeypatch.setattr(tg.requests, "post", fake_post)
+    tg.set_my_commands([{"command": "bg", "description": "x"}])
+    assert posted["method"] == "setMyCommands"
+    assert posted["json"]["commands"][0]["command"] == "bg"

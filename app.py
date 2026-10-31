@@ -116,6 +116,17 @@ def webhook() -> tuple[str, int]:
     return "ok\n", 200
 
 
+def _register_commands() -> None:
+    """Fill the "/" menu. Cosmetic, so a failure is logged and ignored."""
+    from common.updates import BOT_COMMANDS
+
+    try:
+        tg.set_my_commands(BOT_COMMANDS)
+        log.info("command menu registered (%d commands)", len(BOT_COMMANDS))
+    except tg.TelegramError as exc:
+        log.warning("setMyCommands failed: %s", exc)
+
+
 def _register_webhook() -> None:
     external = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("RENDER_EXTERNAL_HOSTNAME")
     if not external:
@@ -165,6 +176,9 @@ def main() -> None:
             "ALLOWED_USER_IDS is empty — nobody will be able to use the bot. "
             "Set it to a comma-separated list of numeric Telegram IDs."
         )
+
+    if config.BOT_TOKEN and mode != "off":
+        _register_commands()
 
     if mode == "webhook":
         if config.BOT_TOKEN:

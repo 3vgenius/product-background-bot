@@ -182,6 +182,11 @@ def _not_modified(exc: TelegramError) -> bool:
     return "message is not modified" in str(exc).lower()
 
 
+def set_my_commands(commands: list[dict]) -> None:
+    """Populate the "/" menu in Telegram clients."""
+    call("setMyCommands", {"commands": commands}, timeout=15)
+
+
 def download_by_file_id(file_id: str) -> bytes:
     """Resolve a file_id to bytes via getFile. Subject to the 20 MB Bot API limit."""
     info = call("getFile", {"file_id": file_id}, timeout=30) or {}
