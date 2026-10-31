@@ -804,3 +804,14 @@ def test_start_and_help_work_even_when_storage_is_down(env, monkeypatch):
     _post(env["client"], _message("/help"))
     texts = [m["text"] for m in env["sent"]]
     assert len(texts) == 2 and all("Я заменяю фон" in t for t in texts)
+
+
+def test_background_name_is_one_clean_line(env, fake_download):
+    """The name becomes a workflow input and a caption; a newline or a quote
+    from a phone keyboard must not be able to break either."""
+    _post(env["client"], _message('/bg  Лето\n"у моря"\t\x07 2026  '))
+    _post(env["client"], _photo(file_id="BGFILE"))
+    name = store.list_backgrounds()[0]["name"]
+    assert name == 'Лето "у моря" 2026'
+    _post(env["client"], _photo(file_id="PRODUCT"))
+    assert env["dispatched"][0]["label"] == 'Лето "у моря" 2026'

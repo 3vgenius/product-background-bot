@@ -89,16 +89,28 @@ jobs:
           # 2 threads matches the runner's vCPU count; more threads on 2 cores
           # just adds contention.
           OMP_NUM_THREADS: '2'
+          # Inputs go through the environment, never inline in the script:
+          # ${{ }} is substituted into the shell text before it runs, so a
+          # background named  Лето "у моря"  would break the command and a
+          # name containing $(...) would execute on the runner.
+          IN_CHAT_ID: ${{ github.event.inputs.chat_id }}
+          IN_USER_ID: ${{ github.event.inputs.user_id }}
+          IN_FILE_ID: ${{ github.event.inputs.file_id }}
+          IN_BACKGROUND: ${{ github.event.inputs.background }}
+          IN_ONEOFF_FILE_ID: ${{ github.event.inputs.oneoff_file_id }}
+          IN_MODEL: ${{ github.event.inputs.model }}
+          IN_SIZE: ${{ github.event.inputs.size }}
+          IN_LABEL: ${{ github.event.inputs.label }}
         run: |
           python worker.py \
-            --chat-id "${{ github.event.inputs.chat_id }}" \
-            --user-id "${{ github.event.inputs.user_id }}" \
-            --file-id "${{ github.event.inputs.file_id }}" \
-            --background "${{ github.event.inputs.background }}" \
-            --oneoff-file-id "${{ github.event.inputs.oneoff_file_id }}" \
-            --model "${{ github.event.inputs.model }}" \
-            --size "${{ github.event.inputs.size }}" \
-            --label "${{ github.event.inputs.label }}"
+            --chat-id "$IN_CHAT_ID" \
+            --user-id "$IN_USER_ID" \
+            --file-id "$IN_FILE_ID" \
+            --background "$IN_BACKGROUND" \
+            --oneoff-file-id "$IN_ONEOFF_FILE_ID" \
+            --model "$IN_MODEL" \
+            --size "$IN_SIZE" \
+            --label "$IN_LABEL"
 
       # worker.py already reports expected failures to the user, so this only
       # fires on infrastructure problems (bad secret, runner out of minutes...).
@@ -106,12 +118,14 @@ jobs:
         if: failure()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          IN_CHAT_ID: ${{ github.event.inputs.chat_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python - <<'PY'
           import os
           from common import telegram_api as tg
-          chat_id = "${{ github.event.inputs.chat_id }}"
-          run_url = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          chat_id = os.environ["IN_CHAT_ID"]
+          run_url = os.environ["RUN_URL"]
           try:
               tg.send_message(chat_id, f"⚠️ Обработка упала на уровне инфраструктуры.\nЛоги: {run_url}")
           except Exception as exc:

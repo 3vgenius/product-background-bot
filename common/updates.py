@@ -103,6 +103,14 @@ def _preview_bytes(store_obj: store.LocalStore, item: dict) -> bytes | None:
 # --- background library -----------------------------------------------------
 
 
+def _clean_name(raw: str, limit: int = 60) -> str:
+    """One line, single spaces, bounded. The name travels as a workflow input
+    and ends up in a caption; newlines and control characters have no place
+    in either."""
+    cleaned = "".join(ch if ch.isprintable() else " " for ch in (raw or ""))
+    return " ".join(cleaned.split())[:limit].strip()
+
+
 def add_background(user_id: int, file_id: str, name: str = "") -> dict:
     """Download the image, normalise it, commit it to the repo, index it."""
     from . import imaging
@@ -119,7 +127,7 @@ def add_background(user_id: int, file_id: str, name: str = "") -> dict:
     )
     item = {
         "id": background_id,
-        "name": name.strip()[:60] or f"Фон {background_id}",
+        "name": _clean_name(name) or f"Фон {background_id}",
         "path": path,
         "added_by": user_id,
         "added_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
