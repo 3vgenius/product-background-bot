@@ -852,3 +852,141 @@ def test_register_commands_failure_is_not_fatal(monkeypatch):
 
     monkeypatch.setattr(tg, "set_my_commands", boom)
     app_module._register_commands()  # must not raise
+
+
+# --- background cleaning (object removal) -----------------------------------
+
+
+def _seed_background(env, item):
+    items = store.list_backgrounds()
+    items.append(item)
+    store.save_backgrounds(items)
+    env["tmp_path"].joinpath("backgrounds").mkdir(exist_ok=True)
+    (env["tmp_path"] / item["path"]).write_bytes(_png_bytes(60, 40))
+    if item.get("original_path"):
+        (env["tmp_path"] / item["original_path"]).write_bytes(_png_bytes(60, 40))
+    return item
+
+
+def test_bg_flow_offers_cleaning_after_saving(env, fake_download):
+    _post(env["client"], _message("/bg"))
+    _post(env["client"], _photo(file_id="BGFILE"))
+    confirmation = env["sent"][-1]
+    assert "добавлен" in confirmation["text"]
+    buttons = confirmation["reply_markup"]["inline_keyboard"][0]
+    assert buttons[0]["callback_data"] == "bgclean:1"
+    assert buttons[1]["callback_data"] == "noop"
+
+
+def test_bg_with_caption_offers_cleaning_too(env, fake_download):
+    _post(env["client"], _photo(caption="/bg Стол", file_id="BGFILE"))
+    confirmation = env["sent"][-1]
+    assert confirmation["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "bgclean:1"
+
+
+def test_bgclean_dispatches_a_clean_job(env):
+    _seed_background(env, {"id": 5, "name": "Стол", "path": "backgrounds/5_stol.jpg"})
+    store.update_user(ALLOWED, {"model": "birefnet-general"})
+    _post(env["client"], _callback("bgclean:5"))
+
+    assert len(env["dispatched"]) == 1
+    job = env["dispatched"][0]
+    assert job["task"] == "clean"
+    assert job["background"] == "backgrounds/5_stol.jpg"
+    assert job["background_id"] == "5"
+    assert job["chat_id"] == str(CHAT) and job["user_id"] == str(ALLOWED)
+    assert job["model"] == "birefnet-general"
+    assert "file_id" not in job  # nothing to download for this task
+    assert all(isinstance(v, str) for v in job.values())
+    assert "Запустил очистку фона №5" in env["sent"][-1]["text"]
+    # The library is untouched until the worker reports back.
+    assert "original_path" not in store.list_backgrounds()[0]
+
+
+def test_bgclean_of_unknown_background_is_an_alert(env):
+    _post(env["client"], _callback("bgclean:77"))
+    assert env["dispatched"] == []
+    answer = [m for m in env["sent"] if m["kind"] == "answer"][-1]
+    assert "недоступен" in answer["args"][1]
+
+
+def test_bgclean_dispatch_failure_is_reported(env, monkeypatch):
+    _seed_background(env, {"id": 5, "name": "Стол", "path": "backgrounds/5_stol.jpg"})
+
+    def boom(inputs, **kw):
+        raise actions.DispatchError("HTTP 403")
+
+    monkeypatch.setattr(actions, "dispatch_workflow", boom)
+    _post(env["client"], _callback("bgclean:5"))
+    assert "Не удалось запустить очистку" in env["sent"][-1]["text"]
+
+
+def test_gallery_shows_clean_or_restore_button(env):
+    _seed_background(env, {"id": 5, "name": "Стол", "path": "backgrounds/5.jpg"})
+    _seed_background(
+        env,
+        {
+            "id": 6,
+            "name": "Полка",
+            "path": "backgrounds/6_clean.jpg",
+            "original_path": "backgrounds/6.jpg",
+            "cleaned_at": "2026-10-31T10:00:00Z",
+        },
+    )
+    _post(env["client"], _message("/backgrounds"))
+    photos = [m for m in env["sent"] if m["kind"] == "photo"]
+    assert [p["caption"] for p in photos] == ["№5 — Стол", "№6 — Полка · 🧹 очищен"]
+
+
+def test_gallery_keyboard_rows(env):
+    from common import updates
+
+    plain = updates._gallery_keyboard(5, selected=False)["inline_keyboard"]
+    assert plain[1][0]["callback_data"] == "bgclean:5"
+    cleaned = updates._gallery_keyboard(6, selected=True, cleaned=True)["inline_keyboard"]
+    assert cleaned[1][0]["callback_data"] == "bgorig:6"
+    assert cleaned[0][0]["text"] == "✅ Выбран"
+
+
+def test_bgorig_restores_the_original_and_removes_the_cleaned_file(env):
+    _seed_background(
+        env,
+        {
+            "id": 6,
+            "name": "Полка",
+            "path": "backgrounds/6_clean.jpg",
+            "original_path": "backgrounds/6.jpg",
+            "cleaned_at": "2026-10-31T10:00:00Z",
+        },
+    )
+    store.update_user(ALLOWED, {"background_id": 6})
+    _post(env["client"], _callback("bgorig:6"))
+
+    item = store.list_backgrounds()[0]
+    assert item == {"id": 6, "name": "Полка", "path": "backgrounds/6.jpg"}
+    assert (env["tmp_path"] / "backgrounds" / "6.jpg").exists()
+    assert not (env["tmp_path"] / "backgrounds" / "6_clean.jpg").exists()
+    edit = [m for m in env["sent"] if m["kind"] == "edit"][-1]
+    assert "Оригинал возвращён" in edit["args"][2]
+    keyboard = edit["kwargs"]["reply_markup"]["inline_keyboard"]
+    assert keyboard[0][0]["text"] == "✅ Выбран"
+    assert keyboard[1][0]["callback_data"] == "bgclean:6"  # can be cleaned again
+
+
+def test_bgorig_on_a_never_cleaned_background_is_an_alert(env):
+    _seed_background(env, {"id": 5, "name": "Стол", "path": "backgrounds/5.jpg"})
+    _post(env["client"], _callback("bgorig:5"))
+    answer = [m for m in env["sent"] if m["kind"] == "answer"][-1]
+    assert "оригинальная версия" in answer["args"][1]
+    assert store.list_backgrounds()[0]["path"] == "backgrounds/5.jpg"
+
+
+def test_product_after_cleaning_uses_the_cleaned_file(env):
+    _seed_background(
+        env,
+        {"id": 6, "name": "Полка", "path": "backgrounds/6_clean.jpg", "original_path": "backgrounds/6.jpg"},
+    )
+    store.update_user(ALLOWED, {"background_id": 6})
+    _post(env["client"], _photo(file_id="PRODUCT"))
+    assert env["dispatched"][0]["background"] == "backgrounds/6_clean.jpg"
+    assert env["dispatched"][0].get("task", "replace") == "replace"

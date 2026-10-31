@@ -8,13 +8,22 @@ name: Background replacement
 on:
   workflow_dispatch:
     inputs:
+      task:
+        description: "replace = product onto background; clean = remove objects from a background"
+        required: false
+        default: 'replace'
+      background_id:
+        description: "Library id of the background (for task=clean)"
+        required: false
+        default: ''
       chat_id:
         description: 'Telegram chat to send the result to'
         required: true
         type: string
       file_id:
         description: 'Telegram file_id of the product photo'
-        required: true
+        required: false
+        default: ''
         type: string
       user_id:
         description: 'Telegram user id (for logging)'
@@ -88,8 +97,18 @@ jobs:
           restore-keys: |
             rembg-model-
 
+      # LaMa (object removal) lives apart from the rembg models so that it gets
+      # its own fixed cache key: it never changes, so it is downloaded once.
+      - name: Cache LaMa model
+        if: github.event.inputs.task == 'clean'
+        uses: actions/cache@v4
+        with:
+          path: ~/.lama
+          key: lama-fp32-onnx-v1
+
       - name: Replace background
         env:
+          LAMA_HOME: /home/runner/.lama
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPO: ${{ github.repository }}
@@ -100,6 +119,8 @@ jobs:
           # ${{ }} is substituted into the shell text before it runs, so a
           # background named  Лето "у моря"  would break the command and a
           # name containing $(...) would execute on the runner.
+          IN_TASK: ${{ github.event.inputs.task }}
+          IN_BACKGROUND_ID: ${{ github.event.inputs.background_id }}
           IN_CHAT_ID: ${{ github.event.inputs.chat_id }}
           IN_USER_ID: ${{ github.event.inputs.user_id }}
           IN_FILE_ID: ${{ github.event.inputs.file_id }}
@@ -110,6 +131,8 @@ jobs:
           IN_LABEL: ${{ github.event.inputs.label }}
         run: |
           python worker.py \
+            --task "${IN_TASK:-replace}" \
+            --background-id "$IN_BACKGROUND_ID" \
             --chat-id "$IN_CHAT_ID" \
             --user-id "$IN_USER_ID" \
             --file-id "$IN_FILE_ID" \

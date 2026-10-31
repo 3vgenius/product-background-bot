@@ -117,6 +117,14 @@ ALLOWED_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
 DEFAULT_SIZE = int(_clean(os.getenv("OUTPUT_SIZE")) or 1024)
 DEFAULT_FILL = float(_clean(os.getenv("OBJECT_FILL")) or 0.8)
 BACKGROUND_JPEG_QUALITY = 90
+
+# Background cleaning (object removal). LaMa ONNX export; downloaded once on
+# the Actions runner and kept in the model cache. INPAINT_BACKEND: auto (LaMa,
+# falling back to OpenCV), lama, or opencv.
+LAMA_ONNX_URL = _clean(os.getenv("LAMA_ONNX_URL")) or (
+    "https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx"
+)
+INPAINT_BACKEND = _clean(os.getenv("INPAINT_BACKEND")).lower() or "auto"
 JPEG_QUALITY = int(_clean(os.getenv("JPEG_QUALITY")) or 95)
 
 # Model presets exposed as the "fast / quality" button in the bot.
