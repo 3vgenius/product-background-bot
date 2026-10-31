@@ -3,3 +3,5 @@
 # forwards file_ids to GitHub Actions. rembg is NOT installed here.
 flask>=3.0,<4
 requests>=2.32,<3
+# /bg resizes and re-encodes the background picture before committing it.
+Pillow>=10,<12
