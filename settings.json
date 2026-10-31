@@ -4,7 +4,7 @@
       "background_id": null,
       "model": "birefnet-general",
       "size": 1600,
-      "pending": null,
+      "pending": "add_background",
       "oneoff": null,
       "pending_name": ""
     }
