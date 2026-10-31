@@ -237,3 +237,40 @@ def test_edit_message_does_not_fall_back_when_text_edit_works(monkeypatch):
     monkeypatch.setattr(tg.requests, "post", fake_post)
     tg.edit_message(1, 2, "new text")
     assert calls == ["editMessageText"]
+
+
+def test_edit_message_treats_not_modified_as_success(monkeypatch):
+    """Tapping the option that is already selected re-sends identical text and
+    keyboard; Telegram answers 400 'message is not modified'. That is not an
+    error and must not trigger the caption fallback either."""
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append(url.rsplit("/", 1)[-1])
+        return FakeResponse(
+            status_code=400,
+            text='{"ok":false,"error_code":400,"description":"Bad Request: message is not modified"}',
+        )
+
+    monkeypatch.setattr(tg.requests, "post", fake_post)
+    tg.edit_message(1, 2, "same text")  # must not raise
+    assert calls == ["editMessageText"]
+
+
+def test_edit_message_not_modified_on_caption_is_success_too(monkeypatch):
+    def fake_post(url, **kwargs):
+        if url.endswith("editMessageText"):
+            return FakeResponse(status_code=400, text="there is no text in the message to edit")
+        return FakeResponse(status_code=400, text="Bad Request: message is not modified")
+
+    monkeypatch.setattr(tg.requests, "post", fake_post)
+    tg.edit_message(1, 2, "same caption")  # must not raise
+
+
+def test_edit_message_other_caption_errors_still_raise(monkeypatch):
+    def fake_post(url, **kwargs):
+        return FakeResponse(status_code=400, text="message to edit not found")
+
+    monkeypatch.setattr(tg.requests, "post", fake_post)
+    with pytest.raises(tg.TelegramError):
+        tg.edit_message(1, 2, "x")

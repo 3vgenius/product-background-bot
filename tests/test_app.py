@@ -45,7 +45,9 @@ def env(tmp_path, monkeypatch):
         )
     )
     monkeypatch.setattr(tg, "answer_callback", lambda *a, **k: sent.append({"kind": "answer", "args": a}))
-    monkeypatch.setattr(tg, "edit_message", lambda *a, **k: sent.append({"kind": "edit", "args": a}))
+    monkeypatch.setattr(
+        tg, "edit_message", lambda *a, **k: sent.append({"kind": "edit", "args": a, "kwargs": k})
+    )
 
     dispatched: list[dict] = []
     monkeypatch.setattr(
@@ -433,8 +435,68 @@ def test_callback_deletes_background(env):
     env["tmp_path"].joinpath("backgrounds").mkdir(exist_ok=True)
     (env["tmp_path"] / "backgrounds" / "8.png").write_bytes(b"x")
 
+    # First tap only asks; the shared library must not vanish on a mis-tap.
     _post(env["client"], _callback("bgdel:8"))
+    assert [i["id"] for i in store.list_backgrounds()] == [8]
+    assert (env["tmp_path"] / "backgrounds" / "8.png").exists()
+    edit = [m for m in env["sent"] if m["kind"] == "edit"][-1]
+    assert "Удалить этот фон" in edit["args"][2]
+
+    _post(env["client"], _callback("bgdelyes:8"))
     assert store.list_backgrounds() == []
+    assert not (env["tmp_path"] / "backgrounds" / "8.png").exists()
+    edit = [m for m in env["sent"] if m["kind"] == "edit"][-1]
+    assert "Удалён" in edit["args"][2]
+
+
+def test_delete_can_be_cancelled(env):
+    items = store.list_backgrounds()
+    items.append({"id": 8, "name": "Старый", "path": "backgrounds/8.png"})
+    store.save_backgrounds(items)
+    store.update_user(ALLOWED, {"background_id": 8})
+    _post(env["client"], _callback("bgdel:8"))
+    _post(env["client"], _callback("bgdelno:8"))
+    assert [i["id"] for i in store.list_backgrounds()] == [8]
+    edit = [m for m in env["sent"] if m["kind"] == "edit"][-1]
+    assert "Удалить" not in edit["args"][2]
+    keyboard = edit["kwargs"]["reply_markup"]
+    assert keyboard["inline_keyboard"][0][0]["text"] == "✅ Выбран"
+
+
+def test_delete_resets_everyones_selection_of_that_background(env):
+    items = store.list_backgrounds()
+    items.append({"id": 8, "name": "Старый", "path": "backgrounds/8.png"})
+    items.append({"id": 9, "name": "Другой", "path": "backgrounds/9.png"})
+    store.save_backgrounds(items)
+    store.update_user(ALLOWED, {"background_id": 8})
+    store.update_user(4242, {"background_id": 8})
+    store.update_user(4343, {"background_id": 9})
+
+    _post(env["client"], _callback("bgdelyes:8"))
+
+    settings = store.load_settings()
+    assert settings["users"][str(ALLOWED)]["background_id"] is None
+    assert settings["users"]["4242"]["background_id"] is None
+    assert settings["users"]["4343"]["background_id"] == 9
+
+
+def test_delete_of_unknown_background_is_an_alert(env):
+    _post(env["client"], _callback("bgdelyes:77"))
+    answer = [m for m in env["sent"] if m["kind"] == "answer"][-1]
+    assert "уже удалён" in answer["args"][1]
+
+
+def test_select_callback_rebuilds_keyboard_without_appending_text(env):
+    items = store.list_backgrounds()
+    items.append({"id": 3, "name": "Мрамор", "path": "backgrounds/3.png"})
+    store.save_backgrounds(items)
+    _post(env["client"], _callback("bg:3"))
+    _post(env["client"], _callback("bg:3"))
+    edits = [m for m in env["sent"] if m["kind"] == "edit"]
+    assert len(edits) == 2
+    for e in edits:
+        assert e["args"][2] == "№3 — Мрамор"  # no "✅ Выбран пользователем ..." lines piling up
+    assert store.user_settings(ALLOWED, store.load_settings())["background_id"] == 3
 
 
 def test_callback_noop_is_acknowledged(env):
@@ -600,7 +662,8 @@ def test_bg_then_picture_adds_background_and_selects_it(env, fake_download):
     assert item["name"] == "Мрамор"
     assert item["added_by"] == ALLOWED
     assert (env["tmp_path"] / item["path"]).is_file()
-    assert (env["tmp_path"] / item["path"]).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+    assert item["path"].endswith(".jpg")
+    assert (env["tmp_path"] / item["path"]).read_bytes()[:3] == b"\xff\xd8\xff"
 
     entry = store.user_settings(ALLOWED, store.load_settings())
     assert entry["background_id"] == 1
@@ -730,3 +793,14 @@ def test_outside_testing_mode_handler_runs_in_background(env, monkeypatch):
     assert not finished.is_set()
     release.set()
     assert finished.wait(2)
+
+
+def test_start_and_help_work_even_when_storage_is_down(env, monkeypatch):
+    def down(*a, **k):
+        raise store.StoreError("GET settings.json: transport failure: ConnectionError")
+
+    monkeypatch.setattr(store, "load_settings", down)
+    _post(env["client"], _message("/start"))
+    _post(env["client"], _message("/help"))
+    texts = [m["text"] for m in env["sent"]]
+    assert len(texts) == 2 and all("Я заменяю фон" in t for t in texts)

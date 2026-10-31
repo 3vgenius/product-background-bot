@@ -87,6 +87,18 @@ WORKFLOW_FILE = _clean(os.getenv("WORKFLOW_FILE")) or "process.yml"
 # holds the real background files, so the worker never needs the Contents API.
 REPO_DIR = Path(_clean(os.getenv("REPO_DIR")) or ".").resolve()
 
+# Read local files before asking the GitHub API. Correct only where the
+# checkout is the current branch head: a GitHub Actions runner (GITHUB_ACTIONS
+# is "true" there). On Render the checkout is frozen at deploy time while
+# writes go to GitHub, so local-first reads would be stale.
+_prefer_local_raw = _clean(os.getenv("STORE_PREFER_LOCAL")).lower()
+if _prefer_local_raw in ("1", "true", "yes"):
+    STORE_PREFER_LOCAL = True
+elif _prefer_local_raw in ("0", "false", "no"):
+    STORE_PREFER_LOCAL = False
+else:
+    STORE_PREFER_LOCAL = _clean(os.getenv("GITHUB_ACTIONS")).lower() == "true"
+
 BACKGROUNDS_DIR = "backgrounds"
 BACKGROUNDS_INDEX = "backgrounds.json"
 SETTINGS_FILE = "settings.json"
@@ -104,6 +116,7 @@ ALLOWED_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
 
 DEFAULT_SIZE = int(_clean(os.getenv("OUTPUT_SIZE")) or 1024)
 DEFAULT_FILL = float(_clean(os.getenv("OBJECT_FILL")) or 0.8)
+BACKGROUND_JPEG_QUALITY = 90
 JPEG_QUALITY = int(_clean(os.getenv("JPEG_QUALITY")) or 95)
 
 # Model presets exposed as the "fast / quality" button in the bot.

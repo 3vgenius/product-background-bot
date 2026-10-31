@@ -14,8 +14,12 @@ Two backends:
     Reads/writes files on disk. Used by the GitHub Actions runner (the repo is
     already checked out) and by local development / the test suite.
 
-Reads always prefer a local file when it exists, so the worker never pays for an
-API round-trip it does not need.
+``GithubStore`` reads a local file first only when ``prefer_local`` is on. That
+is right on a GitHub Actions runner (the checkout *is* the branch head) and
+wrong on Render: the checkout there is frozen at deploy time, while writes go
+to GitHub, so a local-first read returns stale settings until the next deploy.
+Production symptom of that bug: "/once, then a product photo, and the bot asks
+for /once again".
 """
 
 from __future__ import annotations
@@ -40,6 +44,18 @@ _READ_CACHE_TTL = 5.0  # seconds
 
 class StoreError(RuntimeError):
     pass
+
+
+# Render auto-deploys the web service on every push to the tracked branch.
+# Data commits made by the bot itself (settings, backgrounds) must not trigger
+# a rebuild: each one cost a 1-2 minute deploy, during which an in-flight
+# update could be killed with the old instance. Render honours this phrase.
+_SKIP_DEPLOY = "[skip render]"
+
+
+def _commit_message(message: str) -> str:
+    message = message.strip()
+    return message if _SKIP_DEPLOY in message else f"{message} {_SKIP_DEPLOY}"
 
 
 class LocalStore:
@@ -110,12 +126,16 @@ class GithubStore(LocalStore):
         branch: str | None = None,
         root: Path | None = None,
         session: requests.Session | None = None,
+        prefer_local: bool | None = None,
     ):
         super().__init__(root)
         self.repo = repo or config.GITHUB_REPO
         self.token = token or config.GITHUB_TOKEN
         self.branch = branch or config.GITHUB_BRANCH
         self.session = session or requests.Session()
+        self.prefer_local = (
+            config.STORE_PREFER_LOCAL if prefer_local is None else bool(prefer_local)
+        )
         self._cache: dict[str, tuple[float, bytes]] = {}
 
     # -- internals -------------------------------------------------------
@@ -129,21 +149,46 @@ class GithubStore(LocalStore):
     def _contents_url(self, rel: str) -> str:
         return f"{config.GITHUB_API}/repos/{self.repo}/contents/{rel}"
 
+    def _request(self, method: str, url: str, what: str, **kwargs: Any) -> requests.Response:
+        """All GitHub traffic goes through here so that a DNS failure, TLS
+        reset or timeout surfaces as StoreError (which callers handle and
+        report) instead of a raw requests exception (which they do not)."""
+        try:
+            return self.session.request(method, url, headers=self._headers(), **kwargs)
+        except requests.RequestException as exc:
+            raise StoreError(f"{what}: transport failure: {exc.__class__.__name__}: {exc}") from exc
+
     def _api_get(self, rel: str) -> bytes | None:
         url = f"{self._contents_url(rel)}?ref={self.branch}"
-        response = self.session.get(url, headers=self._headers(), timeout=30)
+        response = self._request("GET", url, f"GET {rel}", timeout=30)
         if response.status_code == 404:
             return None
         if response.status_code != 200:
             raise StoreError(f"GET {rel}: HTTP {response.status_code} {response.text[:200]}")
         body = response.json()
+        if body.get("encoding") == "base64" and body.get("content"):
+            return base64.b64decode(body["content"])
+        # Files between 1 MB and 100 MB come back with encoding "none" and an
+        # empty content field; the blob endpoint serves them (base64) by sha.
+        # Every real background picture is in that range.
+        sha = body.get("sha")
+        if not sha:
+            raise StoreError(f"GET {rel}: unexpected encoding {body.get('encoding')} and no sha")
+        return self._api_blob(rel, sha)
+
+    def _api_blob(self, rel: str, sha: str) -> bytes:
+        url = f"{config.GITHUB_API}/repos/{self.repo}/git/blobs/{sha}"
+        response = self._request("GET", url, f"BLOB {rel}", timeout=60)
+        if response.status_code != 200:
+            raise StoreError(f"BLOB {rel}: HTTP {response.status_code} {response.text[:200]}")
+        body = response.json()
         if body.get("encoding") != "base64":
-            raise StoreError(f"GET {rel}: unexpected encoding {body.get('encoding')}")
-        return base64.b64decode(body["content"])
+            raise StoreError(f"BLOB {rel}: unexpected encoding {body.get('encoding')}")
+        return base64.b64decode(body.get("content") or "")
 
     def _api_sha(self, rel: str) -> str | None:
         url = f"{self._contents_url(rel)}?ref={self.branch}"
-        response = self.session.get(url, headers=self._headers(), timeout=30)
+        response = self._request("GET", url, f"HEAD {rel}", timeout=30)
         if response.status_code == 404:
             return None
         if response.status_code != 200:
@@ -152,24 +197,24 @@ class GithubStore(LocalStore):
 
     def _api_put(self, rel: str, blob: bytes, message: str, sha: str | None) -> None:
         payload: dict[str, Any] = {
-            "message": message or f"update {rel}",
+            "message": _commit_message(message or f"update {rel}"),
             "content": base64.b64encode(blob).decode("ascii"),
             "branch": self.branch,
         }
         if sha:
             payload["sha"] = sha
-        response = self.session.put(
-            self._contents_url(rel), headers=self._headers(), json=payload, timeout=60
-        )
+        response = self._request("PUT", self._contents_url(rel), f"PUT {rel}", json=payload, timeout=60)
         if response.status_code not in (200, 201):
             raise StoreError(f"PUT {rel}: HTTP {response.status_code} {response.text[:200]}")
 
     # -- API -------------------------------------------------------------
     def read_bytes(self, rel: str) -> bytes | None:
-        # 1. local checkout (GitHub Actions worker) — free and instant
-        local = super().read_bytes(rel)
-        if local is not None:
-            return local
+        # 1. local checkout — only where the checkout is the branch head
+        #    (GitHub Actions). On Render it is frozen at deploy time.
+        if self.prefer_local:
+            local = super().read_bytes(rel)
+            if local is not None:
+                return local
         # 2. short-lived cache — repeated reads inside one webhook call
         cached = self._cache.get(rel)
         if cached and (time.monotonic() - cached[0]) < _READ_CACHE_TTL:
@@ -201,10 +246,11 @@ class GithubStore(LocalStore):
         sha = self._api_sha(rel)
         if not sha:
             return False
-        response = self.session.delete(
+        response = self._request(
+            "DELETE",
             self._contents_url(rel),
-            headers=self._headers(),
-            json={"message": f"delete {rel}", "sha": sha, "branch": self.branch},
+            f"DELETE {rel}",
+            json={"message": _commit_message(f"delete {rel}"), "sha": sha, "branch": self.branch},
             timeout=60,
         )
         if response.status_code != 200:

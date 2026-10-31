@@ -111,7 +111,7 @@ def add_background(user_id: int, file_id: str, name: str = "") -> dict:
     normalized = imaging.normalize_background(blob)
     items = store.list_backgrounds()
     background_id = store.next_background_id(items)
-    filename = f"{background_id}_{int(time.time())}.png"
+    filename = f"{background_id}_{int(time.time())}.jpg"
     path = f"{config.BACKGROUNDS_DIR}/{filename}"
     store_obj = store.get_store()
     store_obj.write_bytes(
@@ -141,6 +141,16 @@ def delete_background(background_id: int) -> bool:
     store_obj.delete(item["path"])
     items = [i for i in items if int(i.get("id", -1)) != background_id]
     store.save_backgrounds(items, message=f"background {background_id} removed")
+    # Nobody should keep pointing at a background that no longer exists: their
+    # next product photo would otherwise be answered with "no background".
+    settings = store.load_settings()
+    changed = False
+    for entry in settings.get("users", {}).values():
+        if isinstance(entry, dict) and entry.get("background_id") == background_id:
+            entry["background_id"] = None
+            changed = True
+    if changed:
+        store.save_settings(settings, message=f"background {background_id} removed: reset selections")
     return True
 
 
@@ -186,6 +196,33 @@ def _describe(entry: dict) -> str:
     )
 
 
+def _gallery_caption(item: dict) -> str:
+    return f"№{item['id']} — {item['name']}"
+
+
+def _gallery_keyboard(background_id: int, selected: bool, confirm_delete: bool = False) -> dict:
+    if confirm_delete:
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "❌ Да, удалить у всех", "callback_data": f"bgdelyes:{background_id}"},
+                    {"text": "Отмена", "callback_data": f"bgdelno:{background_id}"},
+                ]
+            ]
+        }
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "✅ Выбран" if selected else "Выбрать",
+                    "callback_data": f"bg:{background_id}",
+                },
+                {"text": "🗑", "callback_data": f"bgdel:{background_id}"},
+            ]
+        ]
+    }
+
+
 def send_gallery(chat_id: int, user_id: int) -> None:
     store_obj = store.get_store()
     items = store.list_backgrounds()
@@ -194,7 +231,7 @@ def send_gallery(chat_id: int, user_id: int) -> None:
     if not items:
         tg.send_message(
             chat_id,
-            "Фонов пока нет. Пришлите картинку фона вместе с командой /bg — "
+            "Фонов пока нет. Отправьте /bg, а затем картинку фона — "
             "она попадёт в общую библиотеку.",
         )
         return
@@ -207,20 +244,8 @@ def send_gallery(chat_id: int, user_id: int) -> None:
     )
     for item in items[-10:]:
         blob = _preview_bytes(store_obj, item)
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {
-                        "text": "✅ Выбран"
-                        if current_id == item["id"]
-                        else "Выбрать",
-                        "callback_data": f"bg:{item['id']}",
-                    },
-                    {"text": "🗑", "callback_data": f"bgdel:{item['id']}"},
-                ]
-            ]
-        }
-        caption = f"№{item['id']} — {item['name']}"
+        keyboard = _gallery_keyboard(item["id"], selected=current_id == item["id"])
+        caption = _gallery_caption(item)
         if blob is None:
             tg.send_message(chat_id, f"Не удалось показать {caption}.")
             continue
@@ -312,13 +337,16 @@ def handle_message(message: dict) -> None:
     text = _text_of(message)
     command, rest = _command_of(text)
     image = _image_from_message(message)
+
+    if command == "start" or command == "help":
+        # Answer without touching the store: help must work even when GitHub
+        # is unreachable, otherwise the bot looks dead at the worst moment.
+        tg.send_message(chat_id, HELP_TEXT)
+        return
+
     store_obj = store.get_store()
     settings = store.load_settings()
     entry = store.user_settings(user_id, settings)
-
-    if command == "start" or command == "help":
-        tg.send_message(chat_id, HELP_TEXT)
-        return
 
     if command == "cancel":
         store.update_user(user_id, {"pending": None, "pending_name": None, "oneoff": None})
@@ -441,20 +469,50 @@ def handle_callback(query: dict) -> None:
         store.update_user(user_id, {"background_id": background_id})
         tg.answer_callback(callback_id, f"Выбран фон №{background_id}")
         if chat_id and message_id:
+            item = store.find_background(store.list_backgrounds(), background_id)
             tg.edit_message(
                 chat_id,
                 message_id,
-                (message.get("caption") or message.get("text") or "Фон")
-                + f"\n✅ Выбран пользователем {user_id}",
-                reply_markup=message.get("reply_markup"),
+                _gallery_caption(item) if item else (message.get("caption") or "Фон"),
+                reply_markup=_gallery_keyboard(background_id, selected=True),
             )
         return
 
-    if data.startswith("bgdel:"):
+    if data.startswith(("bgdel:", "bgdelyes:", "bgdelno:")):
+        action, _, raw_id = data.partition(":")
         try:
-            background_id = int(data.split(":", 1)[1])
+            background_id = int(raw_id)
         except ValueError:
             tg.answer_callback(callback_id, "Некорректный фон.", show_alert=True)
+            return
+        item = store.find_background(store.list_backgrounds(), background_id)
+        if not item:
+            tg.answer_callback(callback_id, "Этот фон уже удалён.", show_alert=True)
+            return
+        if action == "bgdel":
+            # The library is shared: one accidental tap must not wipe a
+            # background everyone else is using. Ask on the message itself.
+            tg.answer_callback(callback_id)
+            if chat_id and message_id:
+                tg.edit_message(
+                    chat_id,
+                    message_id,
+                    _gallery_caption(item) + "\nУдалить этот фон из общей библиотеки?",
+                    reply_markup=_gallery_keyboard(background_id, selected=False, confirm_delete=True),
+                )
+            return
+        if action == "bgdelno":
+            tg.answer_callback(callback_id, "Оставил.")
+            if chat_id and message_id:
+                entry = store.user_settings(user_id, store.load_settings())
+                tg.edit_message(
+                    chat_id,
+                    message_id,
+                    _gallery_caption(item),
+                    reply_markup=_gallery_keyboard(
+                        background_id, selected=entry.get("background_id") == background_id
+                    ),
+                )
             return
         removed = delete_background(background_id)
         tg.answer_callback(
@@ -462,6 +520,10 @@ def handle_callback(query: dict) -> None:
             f"Фон №{background_id} удалён" if removed else "Фон не найден",
             show_alert=not removed,
         )
+        if removed and chat_id and message_id:
+            tg.edit_message(
+                chat_id, message_id, _gallery_caption(item) + "\n🗑 Удалён.", reply_markup=None
+            )
         return
 
     if data.startswith("model:"):

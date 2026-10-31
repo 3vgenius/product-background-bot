@@ -228,9 +228,35 @@ def test_normalize_background_downscales():
     # 3000x2000 = 6 MP: under the 12 MP background cap, still needs shrinking.
     blob = imaging.normalize_background(_blob(Image.new("RGB", (3000, 2000), BLUE)), max_side=800)
     out = Image.open(io.BytesIO(blob))
-    assert out.format == "PNG"
+    assert out.format == "JPEG"  # photographs; PNG weighed 10-15 MB per background
     assert max(out.size) <= 800
     assert out.size == (800, 533)  # aspect ratio preserved
+
+
+def test_normalize_background_flattens_alpha_to_white():
+    rgba = Image.new("RGBA", (200, 100), (0, 0, 0, 0))
+    blob = imaging.normalize_background(_blob(rgba, "PNG"))
+    out = Image.open(io.BytesIO(blob)).convert("RGB")
+    assert out.getpixel((10, 10)) == (255, 255, 255)
+
+
+def test_normalize_background_is_much_smaller_than_png():
+    """Photograph-like content (smooth gradient + sensor-like grain) is what
+    people upload as backgrounds; PNG handles it badly, JPEG well."""
+    import random
+
+    rng = random.Random(1)
+    w, h = 1200, 800
+    pixels = []
+    for y in range(h):
+        for x in range(w):
+            base = (x * 255 // w, y * 255 // h, (x + y) * 255 // (w + h))
+            pixels.append(tuple(min(255, max(0, c + rng.randint(-6, 6))) for c in base))
+    photo = Image.new("RGB", (w, h))
+    photo.putdata(pixels)
+    raw = _blob(photo, "PNG")
+    blob = imaging.normalize_background(raw)
+    assert len(blob) < len(raw) / 3, (len(blob), len(raw))
 
 
 def test_normalize_background_uses_tighter_cap_than_product_photos(monkeypatch):

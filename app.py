@@ -57,11 +57,19 @@ def _already_seen(update_id: int | None) -> bool:
     return False
 
 
+# One update at a time. settings.json and backgrounds.json are shared files
+# edited read-modify-write; two concurrent handlers would race and one change
+# would be lost (a photo album arrives as several updates within the same
+# second). Throughput is not a concern for a small-team bot, ordering is.
+_handler_lock = threading.Lock()
+
+
 def _run_handler(update: dict) -> None:
-    try:
-        handle_update(update)
-    except Exception:  # handle_update already swallows; this is belt and braces
-        log.exception("handler failed for update %s", update.get("update_id"))
+    with _handler_lock:
+        try:
+            handle_update(update)
+        except Exception:  # handle_update already swallows; this is belt and braces
+            log.exception("handler failed for update %s", update.get("update_id"))
 
 
 def _mode() -> str:
