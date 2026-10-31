@@ -225,7 +225,34 @@ def test_make_preview_accepts_raw_bytes():
 
 
 def test_normalize_background_downscales():
-    blob = imaging.normalize_background(_blob(Image.new("RGB", (5000, 4000), BLUE)), max_side=800)
+    # 3000x2000 = 6 MP: under the 12 MP background cap, still needs shrinking.
+    blob = imaging.normalize_background(_blob(Image.new("RGB", (3000, 2000), BLUE)), max_side=800)
     out = Image.open(io.BytesIO(blob))
     assert out.format == "PNG"
     assert max(out.size) <= 800
+    assert out.size == (800, 533)  # aspect ratio preserved
+
+
+def test_normalize_background_uses_tighter_cap_than_product_photos(monkeypatch):
+    """Backgrounds decode inside the 512 MB Render process, so they get a lower
+    ceiling than product photos (which are decoded on a 7-8 GB runner)."""
+    monkeypatch.setattr(config, "MAX_PIXELS", 25_000_000)
+    monkeypatch.setattr(config, "MAX_BACKGROUND_PIXELS", 100)
+    blob = _blob(Image.new("RGB", (64, 48), BLUE))  # 3072 px: over 100, under 25M
+    with pytest.raises(imaging.ImageRejected, match="мегапиксел"):
+        imaging.normalize_background(blob)
+    # The same bytes are still fine as a product photo.
+    assert imaging.load_image(blob).size == (64, 48)
+
+
+def test_normalize_background_accepts_image_under_cap(monkeypatch):
+    monkeypatch.setattr(config, "MAX_BACKGROUND_PIXELS", 12_000_000)
+    blob = _blob(Image.new("RGB", (640, 480), BLUE))
+    assert imaging.load_image(io.BytesIO(imaging.normalize_background(blob)).read()).size == (640, 480)
+
+
+def test_load_image_max_pixels_override():
+    blob = _blob(Image.new("RGB", (200, 200), BLUE))  # 40k px
+    assert imaging.load_image(blob, max_pixels=1_000_000).size == (200, 200)
+    with pytest.raises(imaging.ImageRejected):
+        imaging.load_image(blob, max_pixels=1000)

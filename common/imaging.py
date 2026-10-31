@@ -20,8 +20,13 @@ class ImageRejected(ValueError):
     """Raised for input the bot refuses to process. The message is user-facing."""
 
 
-def load_image(raw: bytes) -> Image.Image:
-    """Validate raw bytes and return an RGBA image, EXIF orientation applied."""
+def load_image(raw: bytes, max_pixels: int | None = None) -> Image.Image:
+    """Validate raw bytes and return an RGBA image, EXIF orientation applied.
+
+    ``max_pixels`` overrides the global cap for callers that decode in a
+    memory-constrained process (see ``normalize_background``).
+    """
+    limit = max_pixels or config.MAX_PIXELS
     if not raw:
         raise ImageRejected("Пустой файл.")
     if len(raw) > config.MAX_BYTES:
@@ -34,8 +39,12 @@ def load_image(raw: bytes) -> Image.Image:
             raise ImageRejected(
                 f"Формат {fmt or 'неизвестен'} не поддерживается. Нужны JPEG, PNG или WebP."
             )
-        if width * height > config.MAX_PIXELS:
-            raise ImageRejected("Изображение слишком большое: максимум 25 мегапикселей.")
+        # Checked from the header, before decode: rejecting an oversized image
+        # must not cost the memory needed to materialise it.
+        if width * height > limit:
+            raise ImageRejected(
+                f"Изображение слишком большое: максимум {limit // 1_000_000} мегапикселей."
+            )
         image = ImageOps.exif_transpose(image)
         image.load()
     except (UnidentifiedImageError, Image.DecompressionBombError, OSError) as exc:
@@ -134,7 +143,11 @@ def make_preview(raw_or_image: bytes | Image.Image, size: int = 800) -> bytes:
 
 
 def normalize_background(raw: bytes, max_side: int = 3000) -> bytes:
-    """Re-encode an uploaded background so we never store an oversized original."""
-    image = load_image(raw)
+    """Re-encode an uploaded background so we never store an oversized original.
+
+    Uses the tighter background pixel cap: this runs inside the Render process,
+    where the whole image is decoded before being thumbnailed down.
+    """
+    image = load_image(raw, max_pixels=config.MAX_BACKGROUND_PIXELS)
     image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
     return encode_png(image.convert("RGB"))

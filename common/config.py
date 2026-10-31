@@ -72,6 +72,12 @@ SETTINGS_FILE = "settings.json"
 # --- Image processing -------------------------------------------------------
 MAX_BYTES = 19 * 1024 * 1024  # Bot API download limit is 20 MB
 MAX_PIXELS = 25_000_000
+# Backgrounds are decoded fully in the Render process before being thumbnailed
+# down, so they get a tighter cap: at 25 MP one decode peaks near 275 MB, and
+# Flask runs threaded, so two concurrent uploads would blow the 512 MB free-tier
+# limit. 12 MP is well above anything normalize_background keeps (max_side 3000
+# = 9 MP), so this costs no quality.
+MAX_BACKGROUND_PIXELS = 12_000_000
 ALLOWED_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
 
 DEFAULT_SIZE = int(_clean(os.getenv("OUTPUT_SIZE")) or 1024)
