@@ -2,8 +2,10 @@
   {
     "id": 1,
     "name": "Фон 1",
-    "path": "backgrounds/1_1793462601.jpg",
+    "path": "backgrounds/1_1793462601_clean.jpg",
     "added_by": 1314348241,
-    "added_at": "2026-10-31T16:03:23Z"
+    "added_at": "2026-10-31T16:03:23Z",
+    "original_path": "backgrounds/1_1793462601.jpg",
+    "cleaned_at": "2026-10-31T16:05:13Z"
   }
 ]
