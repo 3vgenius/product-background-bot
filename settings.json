@@ -1,12 +1,12 @@
 {
   "users": {
     "1314348241": {
-      "background_id": null,
+      "background_id": 1,
       "model": "birefnet-general",
       "size": 1600,
-      "pending": "add_background",
+      "pending": null,
       "oneoff": null,
-      "pending_name": ""
+      "pending_name": null
     }
   }
 }
