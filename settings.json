@@ -4,8 +4,9 @@
       "background_id": null,
       "model": "isnet-general-use",
       "size": 1024,
-      "pending": null,
-      "oneoff": null
+      "pending": "add_background",
+      "oneoff": null,
+      "pending_name": ""
     }
   }
 }
