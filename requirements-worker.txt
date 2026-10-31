@@ -1,0 +1,6 @@
+# GitHub Actions runner (the heavy half).
+# rembg pulls onnxruntime, which is why this is a separate file from the Render
+# service: the webhook process must stay small enough for the free tier.
+rembg[cpu]>=2.0.61,<3
+Pillow>=10.4,<14
+requests>=2.32,<3

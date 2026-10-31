@@ -1,0 +1,39 @@
+# Render Blueprint: New -> Blueprint -> connect this repository.
+#
+# A Web Service, not a Background Worker: Render has no free background worker,
+# and the paid Starter worker only has 512 MB of RAM. The webhook receiver needs
+# far less than that because it forwards Telegram file_ids to GitHub Actions
+# instead of touching image bytes.
+services:
+  - type: web
+    name: product-background-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      # Token from @BotFather.
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      # Classic PAT with `repo` + `workflow` scopes: `repo` writes backgrounds
+      # and settings through the Contents API, `workflow` triggers process.yml.
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_REPO
+        value: 3vgenius/product-background-bot
+      - key: GITHUB_BRANCH
+        value: main
+      - key: WORKFLOW_FILE
+        value: process.yml
+      # Comma-separated numeric Telegram IDs. Empty means nobody can use the bot.
+      - key: ALLOWED_USER_IDS
+        sync: false
+      # Render generates a random value and echoes it back to the bot, which
+      # passes it to setWebhook. Forged POSTs to /webhook are then rejected.
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      # RENDER_EXTERNAL_URL is provided by Render automatically; app.py uses it
+      # to register the webhook.

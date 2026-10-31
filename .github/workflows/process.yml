@@ -1,0 +1,119 @@
+name: Background replacement
+
+# Triggered by the Render webhook via workflow_dispatch. The webhook never
+# touches image bytes: it only forwards the Telegram file_id, so the free tier
+# (512 MB / 0.1 CPU) is enough for it. All heavy work happens here, on a
+# GitHub-hosted runner (2 vCPU / 7-8 GB RAM) which is free within the monthly
+# private-repo minutes allowance.
+on:
+  workflow_dispatch:
+    inputs:
+      chat_id:
+        description: 'Telegram chat to send the result to'
+        required: true
+        type: string
+      file_id:
+        description: 'Telegram file_id of the product photo'
+        required: true
+        type: string
+      user_id:
+        description: 'Telegram user id (for logging)'
+        required: false
+        type: string
+        default: ''
+      background:
+        description: 'Repo-relative path of a library background'
+        required: false
+        type: string
+        default: ''
+      oneoff_file_id:
+        description: 'Telegram file_id of a one-off background'
+        required: false
+        type: string
+        default: ''
+      model:
+        description: 'rembg model name'
+        required: false
+        type: string
+        default: 'isnet-general-use'
+      size:
+        description: 'Output edge length in pixels'
+        required: false
+        type: string
+        default: '1024'
+      label:
+        description: 'Human-readable background name for the caption'
+        required: false
+        type: string
+        default: ''
+
+# One job per chat, queued rather than cancelled: dropping a run would silently
+# lose the user's photo.
+concurrency:
+  group: background-${{ github.event.inputs.chat_id }}
+  cancel-in-progress: false
+
+jobs:
+  replace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements-worker.txt
+
+      - name: Install worker dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-worker.txt
+
+      # Models live in ~/.rembg/models. Caching avoids re-downloading 200-900 MB
+      # on every single photo; without this a run costs minutes of extra time.
+      - name: Cache rembg model
+        uses: actions/cache@v4
+        with:
+          path: ~/.rembg/models
+          key: rembg-model-${{ github.event.inputs.model }}
+          restore-keys: |
+            rembg-model-
+
+      - name: Replace background
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          # 2 threads matches the runner's vCPU count; more threads on 2 cores
+          # just adds contention.
+          OMP_NUM_THREADS: '2'
+        run: |
+          python worker.py \
+            --chat-id "${{ github.event.inputs.chat_id }}" \
+            --user-id "${{ github.event.inputs.user_id }}" \
+            --file-id "${{ github.event.inputs.file_id }}" \
+            --background "${{ github.event.inputs.background }}" \
+            --oneoff-file-id "${{ github.event.inputs.oneoff_file_id }}" \
+            --model "${{ github.event.inputs.model }}" \
+            --size "${{ github.event.inputs.size }}" \
+            --label "${{ github.event.inputs.label }}"
+
+      # worker.py already reports expected failures to the user, so this only
+      # fires on infrastructure problems (bad secret, runner out of minutes...).
+      - name: Report infrastructure failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          from common import telegram_api as tg
+          chat_id = "${{ github.event.inputs.chat_id }}"
+          run_url = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          try:
+              tg.send_message(chat_id, f"⚠️ Обработка упала на уровне инфраструктуры.\nЛоги: {run_url}")
+          except Exception as exc:
+              print("could not notify:", exc)
+          PY
