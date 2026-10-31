@@ -494,3 +494,51 @@ def test_explicit_mode_wins(monkeypatch):
     monkeypatch.setenv("RENDER_EXTERNAL_URL", "https://x.onrender.com")
     monkeypatch.setattr(config, "BOT_MODE", "off")
     assert app_module._mode() == "off"
+
+
+# --- failures must be reported to the user, not only logged -----------------
+
+
+def test_store_failure_is_reported_to_user(env, monkeypatch):
+    """Regression: a failing GitHub write used to be logged and swallowed, so
+    /once, /bg and settings silently "did not stick". The user must get a
+    message naming the likely cause."""
+
+    def boom(*a, **k):
+        raise store.StoreError("PUT settings.json: HTTP 401 Bad credentials")
+
+    monkeypatch.setattr(store, "update_user", boom)
+    resp = _post(env["client"], _photo(caption="/once"))
+    assert resp.status_code == 200  # never make Telegram redeliver
+    assert env["dispatched"] == []
+    assert len(env["sent"]) == 1
+    text = env["sent"][0]["text"]
+    assert env["sent"][0]["chat_id"] == CHAT
+    assert "HTTP 401" in text
+    assert "GITHUB_TOKEN" in text
+
+
+def test_unexpected_failure_is_reported_to_user(env, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(store, "update_user", boom)
+    resp = _post(env["client"], _message("/once"))
+    assert resp.status_code == 200
+    assert len(env["sent"]) == 1
+    assert "kaboom" in env["sent"][0]["text"]
+
+
+def test_error_reply_failure_does_not_escape(env, monkeypatch):
+    """If even the error message cannot be sent, the webhook still answers 200."""
+
+    def boom(*a, **k):
+        raise store.StoreError("PUT settings.json: HTTP 500")
+
+    def dead_api(*a, **k):
+        raise tg.TelegramError("sendMessage", 0, "transport failure")
+
+    monkeypatch.setattr(store, "update_user", boom)
+    monkeypatch.setattr(tg, "send_message", dead_api)
+    resp = _post(env["client"], _message("/once"))
+    assert resp.status_code == 200

@@ -504,7 +504,42 @@ def handle_update(update: dict[str, Any]) -> None:
             log.debug("ignoring update without message/callback: %s", list(update))
     except tg.TelegramError:
         log.exception("Telegram API error while handling update %s", update.get("update_id"))
-    except store.StoreError:
+    except store.StoreError as exc:
         log.exception("storage error while handling update %s", update.get("update_id"))
-    except Exception:
+        _reply_error(
+            update,
+            "⚠️ Не удалось сохранить данные в репозиторий GitHub.\n"
+            f"{_short(exc)}\n\n"
+            "Обычно это GITHUB_TOKEN в Render: нужен classic-токен с правами "
+            "repo и workflow. Фон/настройка не сохранились, повторите после исправления.",
+        )
+    except Exception as exc:
         log.exception("unexpected error while handling update %s", update.get("update_id"))
+        _reply_error(
+            update,
+            f"⚠️ Внутренняя ошибка бота: {_short(exc)}\nПодробности в логах Render.",
+        )
+
+
+def _chat_id_of(update: dict[str, Any]) -> int | None:
+    """Best-effort chat id for an error reply; None if the update has none."""
+    message = update.get("message") or (update.get("callback_query") or {}).get("message") or {}
+    chat = message.get("chat") or {}
+    return chat.get("id")
+
+
+def _short(exc: BaseException, limit: int = 300) -> str:
+    text = str(exc) or exc.__class__.__name__
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _reply_error(update: dict[str, Any], text: str) -> None:
+    """Tell the user something went wrong. Must never raise: this runs inside
+    the error handler, and a second failure would only hide the first."""
+    chat_id = _chat_id_of(update)
+    if chat_id is None:
+        return
+    try:
+        tg.send_message(chat_id, text)
+    except Exception:  # noqa: BLE001 - last line of defence
+        log.warning("could not deliver error message to chat %s", chat_id)

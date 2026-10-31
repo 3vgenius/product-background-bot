@@ -90,7 +90,7 @@ github.com/settings/tokens с областями **`repo`** и **`workflow`**:
    - `GITHUB_TOKEN` — classic PAT из шага 1
    - `GITHUB_REPO` — `3vgenius/product-background-bot`
    - `ALLOWED_USER_IDS` — числовые Telegram ID через запятую (узнать: [@userinfobot](https://t.me/userinfobot))
-   - `WEBHOOK_SECRET` — любая длинная случайная строка
+   - `WEBHOOK_SECRET` — любая длинная случайная строка (Telegram принимает только латиницу, цифры, `_` и `-`; если значение содержит другие символы, бот сам заменит его на SHA-256 hex, так что сгенерированное Render значение тоже подходит)
 4. После старта бот сам зарегистрирует webhook — в логах будет
    `webhook registered at https://...onrender.com/webhook`.
 
@@ -102,6 +102,24 @@ Render Free засыпает через ~15 минут простоя, а хол
 
 > GitHub отключает scheduled-воркфлоу после 60 дней без активности в репозитории.
 > Если бот перестал отвечать — загляните в Actions → Keep Render warm.
+
+### 4. Если что-то не работает
+
+Первый источник правды — Render → сервис → **Logs**, поле поиска над логами.
+
+| Симптом | Что искать в логах | Причина и лечение |
+|---|---|---|
+| Бот молчит на `/start` | `setWebhook attempt 1 failed: HTTP 401` | Токен в `TELEGRAM_BOT_TOKEN` неверный или отозван через `/revoke`. Взять актуальный в @BotFather → API Token, вставить в Environment → Save. Проверить токен можно в браузере: `https://api.telegram.org/bot<токен>/getMe` → `"ok":true`. |
+| Бот молчит на `/start` | `setWebhook attempt 1 failed: HTTP 400 … illegal characters` | Старая версия бота + секрет с символами вне `A-Za-z0-9_-`. Обновить код (текущая версия нормализует секрет сама) или вписать в `WEBHOOK_SECRET` 30–40 латинских букв и цифр. |
+| Бот молчит на `/start` | строк `POST /webhook` нет, а `webhook registered` есть | Сервис спал, Telegram ждёт. Открыть `https://<сервис>.onrender.com/health`, дождаться `ok`, повторить команду. |
+| «Доступ к боту ограничен» | `ALLOWED_USER_IDS is empty` | Вписать свой числовой ID (узнать у @userinfobot) в `ALLOWED_USER_IDS`. |
+| `/bg` и `/once` «не запоминаются», бот отвечает «Не удалось сохранить данные в репозиторий» | `storage error … PUT settings.json: HTTP 401/403/404` | `GITHUB_TOKEN` в Render не classic или без прав. Нужен **Tokens (classic)** с галками `repo` и `workflow`. |
+| «Не удалось запустить обработку» | `dispatch failed: … 403/404` | У `GITHUB_TOKEN` нет `workflow`, или `process.yml` ещё не в ветке `main`. |
+| «Обрабатываю», а результата нет | Actions → Background replacement → красный запуск | Чаще всего не задан Secret `TELEGRAM_BOT_TOKEN` в GitHub (Settings → Secrets and variables → Actions). |
+
+Браузерная проверка `getMe`/`getWebhookInfo` отвечает `404 Not Found`, когда адрес
+набран с ошибкой (нет префикса `bot`, заглавная `Bot`, пробел, обрезанный токен) —
+это не про токен. Отозванный токен даёт `401 Unauthorized`.
 
 ## Локальный запуск
 

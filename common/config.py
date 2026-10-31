@@ -12,12 +12,34 @@ the modules importable from the test suite without a full environment.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 from pathlib import Path
 
 
 def _clean(value: str | None) -> str:
     return (value or "").strip()
+
+
+_SECRET_ALLOWED = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
+
+
+def normalize_webhook_secret(raw: str | None) -> str:
+    """Return a value Telegram accepts for ``setWebhook(secret_token=...)``.
+
+    Telegram only allows ``A-Z a-z 0-9 _ -`` (1-256 chars). Render's
+    ``generateValue: true`` produces strings with other characters, and
+    ``setWebhook`` then fails with "secret token contains illegal characters"
+    -- which silently leaves the bot without a webhook. Instead of failing, map
+    any non-conforming value to its SHA-256 hex digest: deterministic, 64
+    chars, hex only. Both registration and request verification read the same
+    normalised value, so they stay consistent.
+    """
+    value = _clean(raw)
+    if not value or _SECRET_ALLOWED.match(value):
+        return value
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def parse_id_list(raw: str | None) -> set[int]:
@@ -44,7 +66,7 @@ TELEGRAM_API = _clean(os.getenv("TELEGRAM_API_BASE")) or "https://api.telegram.o
 
 # Shared secret sent by Telegram in X-Telegram-Bot-Api-Secret-Token. When set,
 # updates without it are rejected, so strangers cannot forge webhook calls.
-WEBHOOK_SECRET = _clean(os.getenv("WEBHOOK_SECRET"))
+WEBHOOK_SECRET = normalize_webhook_secret(os.getenv("WEBHOOK_SECRET"))
 
 ALLOWED_USER_IDS = parse_id_list(os.getenv("ALLOWED_USER_IDS"))
 
