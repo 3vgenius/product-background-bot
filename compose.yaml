@@ -1,0 +1,22 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Polling, so no public URL or webhook is needed locally.
+      BOT_MODE: polling
+      # Keep models on a volume: u2net is ~178 MB, birefnet-general ~900 MB.
+      REMBG_HOME: /models
+    ports:
+      - "10000:10000"
+    volumes:
+      - rembg-models:/models
+      # Backgrounds and settings are written straight into the checkout when
+      # GITHUB_TOKEN is absent, so keep them on the host.
+      - ./backgrounds:/app/backgrounds
+      - ./backgrounds.json:/app/backgrounds.json
+      - ./settings.json:/app/settings.json
+
+volumes:
+  rembg-models:

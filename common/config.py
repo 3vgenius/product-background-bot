@@ -1,0 +1,94 @@
+"""Central configuration.
+
+Everything is read from the environment so the same code runs in three places:
+  * Render free web service  (webhook receiver / dispatcher)
+  * GitHub Actions runner    (heavy rembg inference)
+  * local Docker Compose     (development, polling mode)
+
+Nothing in this module raises on import: missing values surface as empty
+strings / empty sets and are validated where they are actually used. That keeps
+the modules importable from the test suite without a full environment.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+
+def _clean(value: str | None) -> str:
+    return (value or "").strip()
+
+
+def parse_id_list(raw: str | None) -> set[int]:
+    """Parse ``"123, 456"`` into ``{123, 456}``.
+
+    Non-numeric entries are ignored instead of crashing the process: a typo in
+    one ID must not take the whole bot down.
+    """
+    ids: set[int] = set()
+    for chunk in (raw or "").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            ids.add(int(chunk))
+        except ValueError:
+            continue
+    return ids
+
+
+# --- Telegram ---------------------------------------------------------------
+BOT_TOKEN = _clean(os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN"))
+TELEGRAM_API = _clean(os.getenv("TELEGRAM_API_BASE")) or "https://api.telegram.org"
+
+# Shared secret sent by Telegram in X-Telegram-Bot-Api-Secret-Token. When set,
+# updates without it are rejected, so strangers cannot forge webhook calls.
+WEBHOOK_SECRET = _clean(os.getenv("WEBHOOK_SECRET"))
+
+ALLOWED_USER_IDS = parse_id_list(os.getenv("ALLOWED_USER_IDS"))
+
+# webhook | polling | off. Render sets RENDER_EXTERNAL_URL, which is the only
+# reliable way to know we are behind a public HTTPS endpoint.
+BOT_MODE = _clean(os.getenv("BOT_MODE")).lower()
+
+# --- GitHub -----------------------------------------------------------------
+GITHUB_TOKEN = _clean(os.getenv("GITHUB_TOKEN"))
+GITHUB_REPO = _clean(os.getenv("GITHUB_REPO")) or "3vgenius/product-background-bot"
+GITHUB_API = _clean(os.getenv("GITHUB_API_BASE")) or "https://api.github.com"
+# Branch the workflow is dispatched against and that the store writes to.
+GITHUB_BRANCH = _clean(os.getenv("GITHUB_BRANCH")) or "main"
+WORKFLOW_FILE = _clean(os.getenv("WORKFLOW_FILE")) or "process.yml"
+
+# --- Storage ----------------------------------------------------------------
+# Repository checkout root. In GitHub Actions this is the working directory and
+# holds the real background files, so the worker never needs the Contents API.
+REPO_DIR = Path(_clean(os.getenv("REPO_DIR")) or ".").resolve()
+
+BACKGROUNDS_DIR = "backgrounds"
+BACKGROUNDS_INDEX = "backgrounds.json"
+SETTINGS_FILE = "settings.json"
+
+# --- Image processing -------------------------------------------------------
+MAX_BYTES = 19 * 1024 * 1024  # Bot API download limit is 20 MB
+MAX_PIXELS = 25_000_000
+ALLOWED_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
+
+DEFAULT_SIZE = int(_clean(os.getenv("OUTPUT_SIZE")) or 1024)
+DEFAULT_FILL = float(_clean(os.getenv("OBJECT_FILL")) or 0.8)
+JPEG_QUALITY = int(_clean(os.getenv("JPEG_QUALITY")) or 95)
+
+# Model presets exposed as the "fast / quality" button in the bot.
+# NOTE: rembg's own default model is now `bria-rmbg`, whose weights require a
+# paid agreement for commercial use. We always pass an explicit model name so
+# that default is never picked up by accident.
+MODEL_FAST = _clean(os.getenv("MODEL_FAST")) or "isnet-general-use"
+MODEL_QUALITY = _clean(os.getenv("MODEL_QUALITY")) or "birefnet-general"
+DEFAULT_MODEL = _clean(os.getenv("DEFAULT_MODEL")) or MODEL_FAST
+
+MODELS: dict[str, str] = {
+    "fast": MODEL_FAST,
+    "quality": MODEL_QUALITY,
+}
+
+SIZE_CHOICES = (1024, 1600, 2048)
