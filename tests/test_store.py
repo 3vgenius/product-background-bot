@@ -94,6 +94,17 @@ class FakeSession:
             raise AssertionError(f"unexpected {method} call")
         return queue.pop(0)
 
+    def request(self, method, url, headers=None, timeout=None, json=None):
+        # GithubStore funnels everything through session.request; keep the
+        # per-method scripts so the tests read naturally.
+        if method == "GET":
+            return self.get(url, headers=headers, timeout=timeout)
+        if method == "PUT":
+            return self.put(url, headers=headers, json=json, timeout=timeout)
+        if method == "DELETE":
+            return self.delete(url, headers=headers, json=json, timeout=timeout)
+        raise AssertionError(f"unexpected method {method}")
+
     def get(self, url, headers=None, timeout=None):
         self.calls.append(("get", url))
         return self._next("get")
@@ -107,13 +118,14 @@ class FakeSession:
         return self._next("delete")
 
 
-def _github_store(tmp_path, session):
+def _github_store(tmp_path, session, prefer_local=False):
     return store.GithubStore(
         repo="acme/repo",
         token="TOKEN",
         branch="main",
         root=tmp_path,
         session=session,
+        prefer_local=prefer_local,
     )
 
 
@@ -136,13 +148,88 @@ def test_github_read_raises_on_server_error(tmp_path):
         _github_store(tmp_path, session).read_bytes("x.json")
 
 
-def test_github_read_prefers_local_checkout(tmp_path):
+def test_github_read_prefers_local_checkout_on_actions_runner(tmp_path):
     """The Actions worker must not pay for an API call it does not need."""
     (tmp_path / "backgrounds").mkdir()
     (tmp_path / "backgrounds" / "1.png").write_bytes(b"local-bytes")
     session = FakeSession({})  # any call raises
-    assert _github_store(tmp_path, session).read_bytes("backgrounds/1.png") == b"local-bytes"
+    got = _github_store(tmp_path, session, prefer_local=True).read_bytes("backgrounds/1.png")
+    assert got == b"local-bytes"
     assert session.calls == []
+
+
+def test_github_read_ignores_stale_local_checkout_on_web_service(tmp_path):
+    """Regression for the worst production bug: on Render the checkout is
+    frozen at deploy time, writes go to GitHub, and local-first reads returned
+    the deploy-time settings.json. /once "did not stick" until Render happened
+    to redeploy from the bot's own commit."""
+    (tmp_path / "settings.json").write_text('{"users": {"1": {"oneoff": null}}}')
+    fresh = {"encoding": "base64", "content": base64.b64encode(b'{"users": {"1": {"oneoff": "F"}}}').decode()}
+    session = FakeSession({"get": [FakeResponse(200, fresh)]})
+    got = _github_store(tmp_path, session).read_bytes("settings.json")
+    assert json.loads(got)["users"]["1"]["oneoff"] == "F"
+    assert len(session.calls) == 1
+
+
+def test_prefer_local_defaults_follow_environment(monkeypatch, tmp_path):
+    """Off on Render, on inside GitHub Actions, overridable either way."""
+    import importlib
+
+    from common import config
+
+    def reload_with(env):
+        for k in ("STORE_PREFER_LOCAL", "GITHUB_ACTIONS"):
+            monkeypatch.delenv(k, raising=False)
+        for k, v in env.items():
+            monkeypatch.setenv(k, v)
+        return importlib.reload(config).STORE_PREFER_LOCAL
+
+    try:
+        assert reload_with({}) is False
+        assert reload_with({"GITHUB_ACTIONS": "true"}) is True
+        assert reload_with({"GITHUB_ACTIONS": "true", "STORE_PREFER_LOCAL": "0"}) is False
+        assert reload_with({"STORE_PREFER_LOCAL": "1"}) is True
+    finally:
+        reload_with({})
+
+
+def test_github_read_falls_back_to_blob_api_for_large_files(tmp_path):
+    """Contents API returns encoding "none" and empty content for 1-100 MB
+    files - i.e. for every real background picture."""
+    big = b"\x89PNG" + b"x" * 2000
+    listing = {"encoding": "none", "content": "", "sha": "blobsha", "size": len(big)}
+    blob = {"encoding": "base64", "content": base64.b64encode(big).decode()}
+    session = FakeSession({"get": [FakeResponse(200, listing), FakeResponse(200, blob)]})
+    assert _github_store(tmp_path, session).read_bytes("backgrounds/1.png") == big
+    assert session.calls[1][1].endswith("/repos/acme/repo/git/blobs/blobsha")
+
+
+def test_github_read_large_file_without_sha_is_an_error(tmp_path):
+    listing = {"encoding": "none", "content": ""}
+    session = FakeSession({"get": [FakeResponse(200, listing)]})
+    with pytest.raises(store.StoreError):
+        _github_store(tmp_path, session).read_bytes("backgrounds/1.png")
+
+
+def test_github_blob_api_error_is_a_store_error(tmp_path):
+    listing = {"encoding": "none", "content": "", "sha": "blobsha"}
+    session = FakeSession({"get": [FakeResponse(200, listing), FakeResponse(403, {"message": "nope"})]})
+    with pytest.raises(store.StoreError, match="BLOB"):
+        _github_store(tmp_path, session).read_bytes("backgrounds/1.png")
+
+
+def test_data_commits_skip_render_auto_deploy(tmp_path):
+    """Every bot commit used to rebuild the Render service (1-2 min each)."""
+    assert store._commit_message("update settings") == "update settings [skip render]"
+    assert store._commit_message("x [skip render]") == "x [skip render]"
+    session = FakeSession(
+        {"get": [FakeResponse(404, {})], "put": [FakeResponse(201, {})]}
+    )
+    _github_store(tmp_path, session).write_bytes("settings.json", b"{}", "settings: user 1")
+    assert session.calls[-1][2]["message"].endswith("[skip render]")
+    session = FakeSession({"get": [FakeResponse(200, {"sha": "s"})], "delete": [FakeResponse(200, {})]})
+    _github_store(tmp_path, session).delete("backgrounds/1.png")
+    assert "[skip render]" in session.calls[-1][2]["message"]
 
 
 def test_github_read_is_cached(tmp_path):
@@ -168,7 +255,7 @@ def test_github_write_sends_base64_and_sha(tmp_path):
     assert url.endswith("/repos/acme/repo/contents/settings.json")
     assert body["sha"] == "abc123"
     assert body["branch"] == "main"
-    assert body["message"] == "update settings"
+    assert body["message"] == "update settings [skip render]"
     assert base64.b64decode(body["content"]) == b'{"a": 1}'
 
 
@@ -309,3 +396,22 @@ def test_load_settings_recovers_from_corruption(local):
 def test_load_settings_heals_bad_shape(local):
     local.write_json(config.SETTINGS_FILE, {"users": "oops"})
     assert store.load_settings(local) == {"users": {}}
+
+
+def test_github_transport_failures_are_store_errors(tmp_path):
+    """A DNS failure / TLS reset / timeout must surface as StoreError so the
+    user gets a message, not as a raw requests exception nobody catches.
+    Found by running the real server against an unreachable api.github.com."""
+    import requests
+
+    class DeadSession:
+        def request(self, *a, **k):
+            raise requests.ConnectionError("Max retries exceeded with url: /repos/x")
+
+    s = store.GithubStore(repo="acme/repo", token="T", branch="main", root=tmp_path, session=DeadSession())
+    with pytest.raises(store.StoreError, match="transport failure"):
+        s.read_bytes("settings.json")
+    with pytest.raises(store.StoreError, match="transport failure"):
+        s.write_bytes("settings.json", b"{}", "m")
+    with pytest.raises(store.StoreError, match="transport failure"):
+        s.delete("backgrounds/1.jpg")

@@ -33,6 +33,9 @@ services:
         sync: false
       # Render generates a random value and echoes it back to the bot, which
       # passes it to setWebhook. Forged POSTs to /webhook are then rejected.
+      # Render's generated value may contain characters Telegram rejects
+      # ("+", "/", "="); common/config.py maps such values to a SHA-256 hex
+      # digest before use, so any value works here.
       - key: WEBHOOK_SECRET
         generateValue: true
       # RENDER_EXTERNAL_URL is provided by Render automatically; app.py uses it

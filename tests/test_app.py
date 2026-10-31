@@ -8,7 +8,10 @@ handling and the store writes are all genuinely executed.
 
 from __future__ import annotations
 
+import itertools
 import json
+import threading
+import time
 
 import pytest
 
@@ -17,6 +20,7 @@ from common import actions, config, store, telegram_api as tg
 ALLOWED = 111
 OUTSIDER = 999
 CHAT = 555
+_update_ids = itertools.count(1000)
 
 
 @pytest.fixture()
@@ -41,7 +45,9 @@ def env(tmp_path, monkeypatch):
         )
     )
     monkeypatch.setattr(tg, "answer_callback", lambda *a, **k: sent.append({"kind": "answer", "args": a}))
-    monkeypatch.setattr(tg, "edit_message", lambda *a, **k: sent.append({"kind": "edit", "args": a}))
+    monkeypatch.setattr(
+        tg, "edit_message", lambda *a, **k: sent.append({"kind": "edit", "args": a, "kwargs": k})
+    )
 
     dispatched: list[dict] = []
     monkeypatch.setattr(
@@ -51,6 +57,7 @@ def env(tmp_path, monkeypatch):
     import app as app_module
 
     app_module.app.config["TESTING"] = True
+    app_module._seen.clear()
     return {
         "client": app_module.app.test_client(),
         "sent": sent,
@@ -71,7 +78,7 @@ def _message(text=None, user_id=ALLOWED, chat_id=CHAT, **extra):
     if text is not None:
         message["text"] = text
     message.update(extra)
-    return {"update_id": 1, "message": message}
+    return {"update_id": next(_update_ids), "message": message}
 
 
 def _photo(user_id=ALLOWED, chat_id=CHAT, caption=None, file_id="PROD"):
@@ -86,12 +93,12 @@ def _photo(user_id=ALLOWED, chat_id=CHAT, caption=None, file_id="PROD"):
     }
     if caption is not None:
         message["caption"] = caption
-    return {"update_id": 2, "message": message}
+    return {"update_id": next(_update_ids), "message": message}
 
 
 def _callback(data, user_id=ALLOWED):
     return {
-        "update_id": 3,
+        "update_id": next(_update_ids),
         "callback_query": {
             "id": "cb1",
             "from": {"id": user_id},
@@ -229,9 +236,21 @@ def test_cancel_clears_pending_state(env):
     assert entry["oneoff"] is None
 
 
-def test_bg_without_image_explains_usage(env):
+def test_bg_without_image_waits_for_the_next_picture(env):
+    """Regression: /bg alone used to only print usage and remember nothing, so
+    the picture sent next was treated as a product photo and the user was told
+    to add a background via /bg - an endless loop on a phone."""
     _post(env["client"], _message("/bg"))
-    assert "вместе с командой /bg" in env["sent"][0]["text"]
+    entry = store.user_settings(ALLOWED, store.load_settings())
+    assert entry["pending"] == "add_background"
+    assert "следующим сообщением" in env["sent"][0]["text"]
+
+
+def test_bg_with_name_remembers_it_for_the_next_picture(env):
+    _post(env["client"], _message("/bg Мрамор"))
+    entry = store.user_settings(ALLOWED, store.load_settings())
+    assert entry["pending"] == "add_background"
+    assert entry["pending_name"] == "Мрамор"
 
 
 def test_once_without_image_sets_pending(env):
@@ -252,7 +271,8 @@ def test_once_with_image_stores_oneoff(env):
 def test_product_photo_without_background_is_not_dispatched(env):
     _post(env["client"], _photo())
     assert env["dispatched"] == []
-    assert "Сначала выберите фон" in env["sent"][0]["text"]
+    assert "Фон ещё не выбран" in env["sent"][0]["text"]
+    assert "/bg" in env["sent"][0]["text"]
 
 
 def test_product_photo_dispatches_with_settings(env):
@@ -286,7 +306,10 @@ def test_picks_the_largest_photo_from_an_album(env):
     assert env["dispatched"][0]["file_id"] == "PROD"  # 50000 bytes, not "small"
 
 
-def test_oneoff_background_wins_and_is_consumed(env):
+def test_oneoff_background_wins_and_survives_until_delivered(env):
+    """The one-off is cleared by the worker after a successful delivery, not
+    here: if the job never starts (runner budget, outage) or fails, the user
+    re-sends the product photo instead of re-uploading the background."""
     items = store.list_backgrounds()
     items.append({"id": 1, "name": "Фон", "path": "backgrounds/1.png"})
     store.save_backgrounds(items)
@@ -297,7 +320,7 @@ def test_oneoff_background_wins_and_is_consumed(env):
     job = env["dispatched"][0]
     assert job["oneoff_file_id"] == "ONEOFF_BG"
     assert job["background"] == ""
-    assert store.user_settings(ALLOWED, store.load_settings())["oneoff"] is None
+    assert store.user_settings(ALLOWED, store.load_settings())["oneoff"] == "ONEOFF_BG"
 
 
 def test_pending_once_then_product_photo(env):
@@ -415,8 +438,68 @@ def test_callback_deletes_background(env):
     env["tmp_path"].joinpath("backgrounds").mkdir(exist_ok=True)
     (env["tmp_path"] / "backgrounds" / "8.png").write_bytes(b"x")
 
+    # First tap only asks; the shared library must not vanish on a mis-tap.
     _post(env["client"], _callback("bgdel:8"))
+    assert [i["id"] for i in store.list_backgrounds()] == [8]
+    assert (env["tmp_path"] / "backgrounds" / "8.png").exists()
+    edit = [m for m in env["sent"] if m["kind"] == "edit"][-1]
+    assert "Удалить этот фон" in edit["args"][2]
+
+    _post(env["client"], _callback("bgdelyes:8"))
     assert store.list_backgrounds() == []
+    assert not (env["tmp_path"] / "backgrounds" / "8.png").exists()
+    edit = [m for m in env["sent"] if m["kind"] == "edit"][-1]
+    assert "Удалён" in edit["args"][2]
+
+
+def test_delete_can_be_cancelled(env):
+    items = store.list_backgrounds()
+    items.append({"id": 8, "name": "Старый", "path": "backgrounds/8.png"})
+    store.save_backgrounds(items)
+    store.update_user(ALLOWED, {"background_id": 8})
+    _post(env["client"], _callback("bgdel:8"))
+    _post(env["client"], _callback("bgdelno:8"))
+    assert [i["id"] for i in store.list_backgrounds()] == [8]
+    edit = [m for m in env["sent"] if m["kind"] == "edit"][-1]
+    assert "Удалить" not in edit["args"][2]
+    keyboard = edit["kwargs"]["reply_markup"]
+    assert keyboard["inline_keyboard"][0][0]["text"] == "✅ Выбран"
+
+
+def test_delete_resets_everyones_selection_of_that_background(env):
+    items = store.list_backgrounds()
+    items.append({"id": 8, "name": "Старый", "path": "backgrounds/8.png"})
+    items.append({"id": 9, "name": "Другой", "path": "backgrounds/9.png"})
+    store.save_backgrounds(items)
+    store.update_user(ALLOWED, {"background_id": 8})
+    store.update_user(4242, {"background_id": 8})
+    store.update_user(4343, {"background_id": 9})
+
+    _post(env["client"], _callback("bgdelyes:8"))
+
+    settings = store.load_settings()
+    assert settings["users"][str(ALLOWED)]["background_id"] is None
+    assert settings["users"]["4242"]["background_id"] is None
+    assert settings["users"]["4343"]["background_id"] == 9
+
+
+def test_delete_of_unknown_background_is_an_alert(env):
+    _post(env["client"], _callback("bgdelyes:77"))
+    answer = [m for m in env["sent"] if m["kind"] == "answer"][-1]
+    assert "уже удалён" in answer["args"][1]
+
+
+def test_select_callback_rebuilds_keyboard_without_appending_text(env):
+    items = store.list_backgrounds()
+    items.append({"id": 3, "name": "Мрамор", "path": "backgrounds/3.png"})
+    store.save_backgrounds(items)
+    _post(env["client"], _callback("bg:3"))
+    _post(env["client"], _callback("bg:3"))
+    edits = [m for m in env["sent"] if m["kind"] == "edit"]
+    assert len(edits) == 2
+    for e in edits:
+        assert e["args"][2] == "№3 — Мрамор"  # no "✅ Выбран пользователем ..." lines piling up
+    assert store.user_settings(ALLOWED, store.load_settings())["background_id"] == 3
 
 
 def test_callback_noop_is_acknowledged(env):
@@ -494,3 +577,416 @@ def test_explicit_mode_wins(monkeypatch):
     monkeypatch.setenv("RENDER_EXTERNAL_URL", "https://x.onrender.com")
     monkeypatch.setattr(config, "BOT_MODE", "off")
     assert app_module._mode() == "off"
+
+
+# --- failures must be reported to the user, not only logged -----------------
+
+
+def test_store_failure_is_reported_to_user(env, monkeypatch):
+    """Regression: a failing GitHub write used to be logged and swallowed, so
+    /once, /bg and settings silently "did not stick". The user must get a
+    message naming the likely cause."""
+
+    def boom(*a, **k):
+        raise store.StoreError("PUT settings.json: HTTP 401 Bad credentials")
+
+    monkeypatch.setattr(store, "update_user", boom)
+    resp = _post(env["client"], _photo(caption="/once"))
+    assert resp.status_code == 200  # never make Telegram redeliver
+    assert env["dispatched"] == []
+    assert len(env["sent"]) == 1
+    text = env["sent"][0]["text"]
+    assert env["sent"][0]["chat_id"] == CHAT
+    assert "HTTP 401" in text
+    assert "GITHUB_TOKEN" in text
+
+
+def test_unexpected_failure_is_reported_to_user(env, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(store, "update_user", boom)
+    resp = _post(env["client"], _message("/once"))
+    assert resp.status_code == 200
+    assert len(env["sent"]) == 1
+    assert "kaboom" in env["sent"][0]["text"]
+
+
+def test_error_reply_failure_does_not_escape(env, monkeypatch):
+    """If even the error message cannot be sent, the webhook still answers 200."""
+
+    def boom(*a, **k):
+        raise store.StoreError("PUT settings.json: HTTP 500")
+
+    def dead_api(*a, **k):
+        raise tg.TelegramError("sendMessage", 0, "transport failure")
+
+    monkeypatch.setattr(store, "update_user", boom)
+    monkeypatch.setattr(tg, "send_message", dead_api)
+    resp = _post(env["client"], _message("/once"))
+    assert resp.status_code == 200
+
+
+# --- adding a background: the full path, not just the pending flag ---------
+
+
+def _png_bytes(w=900, h=600, color=(10, 20, 200)):
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (w, h), color).save(buf, "PNG")
+    return buf.getvalue()
+
+
+@pytest.fixture()
+def fake_download(monkeypatch):
+    """Serve a real PNG for any file_id; records what was asked for."""
+    asked: list[str] = []
+
+    def download(file_id):
+        asked.append(file_id)
+        return _png_bytes()
+
+    monkeypatch.setattr(tg, "download_by_file_id", download)
+    return asked
+
+
+def test_bg_then_picture_adds_background_and_selects_it(env, fake_download):
+    _post(env["client"], _message("/bg Мрамор"))
+    _post(env["client"], _photo(file_id="BGFILE"))
+
+    assert fake_download == ["BGFILE"]
+    items = store.list_backgrounds()
+    assert len(items) == 1
+    item = items[0]
+    assert item["id"] == 1
+    assert item["name"] == "Мрамор"
+    assert item["added_by"] == ALLOWED
+    assert (env["tmp_path"] / item["path"]).is_file()
+    assert item["path"].endswith(".jpg")
+    assert (env["tmp_path"] / item["path"]).read_bytes()[:3] == b"\xff\xd8\xff"
+
+    entry = store.user_settings(ALLOWED, store.load_settings())
+    assert entry["background_id"] == 1
+    assert entry["pending"] is None
+    assert entry["pending_name"] is None
+
+    confirmation = env["sent"][-1]["text"]
+    assert "Фон №1" in confirmation and "Мрамор" in confirmation
+    assert env["dispatched"] == []  # the background picture is not a product
+
+
+def test_picture_with_bg_caption_still_works(env, fake_download):
+    """The old one-message form must keep working for people who knew it."""
+    _post(env["client"], _photo(caption="/bg Дерево", file_id="BGFILE"))
+    items = store.list_backgrounds()
+    assert [i["name"] for i in items] == ["Дерево"]
+    assert store.user_settings(ALLOWED, store.load_settings())["background_id"] == 1
+
+
+def test_caption_on_the_picture_overrides_name_from_bg(env, fake_download):
+    _post(env["client"], _message("/bg Старое"))
+    _post(env["client"], _photo(caption="Новое", file_id="BGFILE"))
+    assert [i["name"] for i in store.list_backgrounds()] == ["Новое"]
+
+
+def test_product_photo_after_bg_flow_is_dispatched_with_that_background(env, fake_download):
+    _post(env["client"], _message("/bg"))
+    _post(env["client"], _photo(file_id="BGFILE"))
+    _post(env["client"], _photo(file_id="PRODUCT"))
+
+    assert len(env["dispatched"]) == 1
+    job = env["dispatched"][0]
+    assert job["file_id"] == "PRODUCT"
+    assert job["background"] == store.list_backgrounds()[0]["path"]
+    assert job["oneoff_file_id"] == ""
+    assert job["label"] == "Фон 1"
+    assert "Принял" in env["sent"][-1]["text"]
+
+
+def test_bg_flow_reports_unreadable_picture(env, monkeypatch):
+    monkeypatch.setattr(tg, "download_by_file_id", lambda fid: b"not an image at all")
+    _post(env["client"], _message("/bg"))
+    _post(env["client"], _photo(file_id="BAD"))
+    assert store.list_backgrounds() == []
+    assert "Не получилось добавить фон" in env["sent"][-1]["text"]
+    # The intent is kept so the user can simply send another picture.
+    assert store.user_settings(ALLOWED, store.load_settings())["pending"] == "add_background"
+
+
+def test_cancel_clears_bg_intent(env):
+    _post(env["client"], _message("/bg Имя"))
+    _post(env["client"], _message("/cancel"))
+    entry = store.user_settings(ALLOWED, store.load_settings())
+    assert entry["pending"] is None
+    assert entry["pending_name"] is None
+
+
+# --- redelivery and background processing ----------------------------------
+
+
+def test_duplicate_delivery_is_ignored(env):
+    """Telegram redelivers an update when it did not get a timely 2xx. The
+    second copy must not produce a second reply (or a second Actions run)."""
+    update = _message("/start")
+    assert _post(env["client"], update).status_code == 200
+    assert _post(env["client"], update).status_code == 200
+    assert len(env["sent"]) == 1
+
+
+def test_duplicate_product_photo_is_dispatched_once(env):
+    items = store.list_backgrounds()
+    items.append({"id": 3, "name": "Мрамор", "path": "backgrounds/3.png"})
+    store.save_backgrounds(items)
+    store.update_user(ALLOWED, {"background_id": 3})
+    update = _photo(file_id="PRODUCT")
+    _post(env["client"], update)
+    _post(env["client"], update)
+    assert len(env["dispatched"]) == 1
+
+
+def test_updates_without_id_are_never_deduplicated(env):
+    upd = _message("/start")
+    del upd["update_id"]
+    _post(env["client"], upd)
+    _post(env["client"], upd)
+    assert len(env["sent"]) == 2
+
+
+def test_seen_cache_is_bounded(env):
+    import app as app_module
+
+    for i in range(app_module._SEEN_LIMIT + 50):
+        app_module._already_seen(10_000_000 + i)
+    assert len(app_module._seen) == app_module._SEEN_LIMIT
+    # The newest id is still known...
+    assert app_module._already_seen(10_000_000 + app_module._SEEN_LIMIT + 49) is True
+    # ...and the oldest was evicted, so it reads as new again.
+    assert 10_000_000 not in app_module._seen
+    assert app_module._already_seen(10_000_000) is False
+
+
+def test_outside_testing_mode_handler_runs_in_background(env, monkeypatch):
+    """In production the POST returns before the handler finishes, so a slow
+    /bg cannot make Telegram time out and redeliver."""
+    import app as app_module
+
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def slow_handler(update):
+        started.set()
+        release.wait(5)
+        finished.set()
+
+    monkeypatch.setattr(app_module, "handle_update", slow_handler)
+    app_module.app.config["TESTING"] = False
+    try:
+        t0 = time.monotonic()
+        resp = _post(env["client"], _message("/start"))
+        elapsed = time.monotonic() - t0
+    finally:
+        app_module.app.config["TESTING"] = True
+    assert resp.status_code == 200
+    assert elapsed < 1.0, "request must not wait for the handler"
+    assert started.wait(2)
+    assert not finished.is_set()
+    release.set()
+    assert finished.wait(2)
+
+
+def test_start_and_help_work_even_when_storage_is_down(env, monkeypatch):
+    def down(*a, **k):
+        raise store.StoreError("GET settings.json: transport failure: ConnectionError")
+
+    monkeypatch.setattr(store, "load_settings", down)
+    _post(env["client"], _message("/start"))
+    _post(env["client"], _message("/help"))
+    texts = [m["text"] for m in env["sent"]]
+    assert len(texts) == 2 and all("Я заменяю фон" in t for t in texts)
+
+
+def test_background_name_is_one_clean_line(env, fake_download):
+    """The name becomes a workflow input and a caption; a newline or a quote
+    from a phone keyboard must not be able to break either."""
+    _post(env["client"], _message('/bg  Лето\n"у моря"\t\x07 2026  '))
+    _post(env["client"], _photo(file_id="BGFILE"))
+    name = store.list_backgrounds()[0]["name"]
+    assert name == 'Лето "у моря" 2026'
+    _post(env["client"], _photo(file_id="PRODUCT"))
+    assert env["dispatched"][0]["label"] == 'Лето "у моря" 2026'
+
+
+def test_command_menu_matches_the_handled_commands():
+    """Every menu entry must be a command the bot actually handles, and every
+    documented command must be in the menu (except /start, which Telegram
+    shows on its own)."""
+    from common.updates import BOT_COMMANDS, HELP_TEXT
+
+    menu = {c["command"] for c in BOT_COMMANDS}
+    assert menu == {"bg", "backgrounds", "once", "settings", "cancel", "help"}
+    for c in BOT_COMMANDS:
+        assert 1 <= len(c["description"]) <= 256
+        assert c["command"] == c["command"].lower()
+    for cmd in ("/bg", "/backgrounds", "/once", "/settings", "/cancel"):
+        assert cmd in HELP_TEXT
+
+
+def test_help_mentions_new_behaviour():
+    from common.updates import HELP_TEXT
+
+    assert "затем пришлите картинку" in HELP_TEXT
+    assert "🗑" in HELP_TEXT and "подтверждением" in HELP_TEXT
+    assert "ещё раз" in HELP_TEXT  # /once survives a failed job
+    assert "Быстро" in HELP_TEXT and "Качество" in HELP_TEXT
+
+
+def test_register_commands_failure_is_not_fatal(monkeypatch):
+    import app as app_module
+
+    def boom(commands):
+        raise tg.TelegramError("setMyCommands", 0, "transport failure")
+
+    monkeypatch.setattr(tg, "set_my_commands", boom)
+    app_module._register_commands()  # must not raise
+
+
+# --- background cleaning (object removal) -----------------------------------
+
+
+def _seed_background(env, item):
+    items = store.list_backgrounds()
+    items.append(item)
+    store.save_backgrounds(items)
+    env["tmp_path"].joinpath("backgrounds").mkdir(exist_ok=True)
+    (env["tmp_path"] / item["path"]).write_bytes(_png_bytes(60, 40))
+    if item.get("original_path"):
+        (env["tmp_path"] / item["original_path"]).write_bytes(_png_bytes(60, 40))
+    return item
+
+
+def test_bg_flow_offers_cleaning_after_saving(env, fake_download):
+    _post(env["client"], _message("/bg"))
+    _post(env["client"], _photo(file_id="BGFILE"))
+    confirmation = env["sent"][-1]
+    assert "добавлен" in confirmation["text"]
+    buttons = confirmation["reply_markup"]["inline_keyboard"][0]
+    assert buttons[0]["callback_data"] == "bgclean:1"
+    assert buttons[1]["callback_data"] == "noop"
+
+
+def test_bg_with_caption_offers_cleaning_too(env, fake_download):
+    _post(env["client"], _photo(caption="/bg Стол", file_id="BGFILE"))
+    confirmation = env["sent"][-1]
+    assert confirmation["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "bgclean:1"
+
+
+def test_bgclean_dispatches_a_clean_job(env):
+    _seed_background(env, {"id": 5, "name": "Стол", "path": "backgrounds/5_stol.jpg"})
+    store.update_user(ALLOWED, {"model": "birefnet-general"})
+    _post(env["client"], _callback("bgclean:5"))
+
+    assert len(env["dispatched"]) == 1
+    job = env["dispatched"][0]
+    assert job["task"] == "clean"
+    assert job["background"] == "backgrounds/5_stol.jpg"
+    assert job["background_id"] == "5"
+    assert job["chat_id"] == str(CHAT) and job["user_id"] == str(ALLOWED)
+    assert job["model"] == "birefnet-general"
+    assert "file_id" not in job  # nothing to download for this task
+    assert all(isinstance(v, str) for v in job.values())
+    assert "Запустил очистку фона №5" in env["sent"][-1]["text"]
+    # The library is untouched until the worker reports back.
+    assert "original_path" not in store.list_backgrounds()[0]
+
+
+def test_bgclean_of_unknown_background_is_an_alert(env):
+    _post(env["client"], _callback("bgclean:77"))
+    assert env["dispatched"] == []
+    answer = [m for m in env["sent"] if m["kind"] == "answer"][-1]
+    assert "недоступен" in answer["args"][1]
+
+
+def test_bgclean_dispatch_failure_is_reported(env, monkeypatch):
+    _seed_background(env, {"id": 5, "name": "Стол", "path": "backgrounds/5_stol.jpg"})
+
+    def boom(inputs, **kw):
+        raise actions.DispatchError("HTTP 403")
+
+    monkeypatch.setattr(actions, "dispatch_workflow", boom)
+    _post(env["client"], _callback("bgclean:5"))
+    assert "Не удалось запустить очистку" in env["sent"][-1]["text"]
+
+
+def test_gallery_shows_clean_or_restore_button(env):
+    _seed_background(env, {"id": 5, "name": "Стол", "path": "backgrounds/5.jpg"})
+    _seed_background(
+        env,
+        {
+            "id": 6,
+            "name": "Полка",
+            "path": "backgrounds/6_clean.jpg",
+            "original_path": "backgrounds/6.jpg",
+            "cleaned_at": "2026-10-31T10:00:00Z",
+        },
+    )
+    _post(env["client"], _message("/backgrounds"))
+    photos = [m for m in env["sent"] if m["kind"] == "photo"]
+    assert [p["caption"] for p in photos] == ["№5 — Стол", "№6 — Полка · 🧹 очищен"]
+
+
+def test_gallery_keyboard_rows(env):
+    from common import updates
+
+    plain = updates._gallery_keyboard(5, selected=False)["inline_keyboard"]
+    assert plain[1][0]["callback_data"] == "bgclean:5"
+    cleaned = updates._gallery_keyboard(6, selected=True, cleaned=True)["inline_keyboard"]
+    assert cleaned[1][0]["callback_data"] == "bgorig:6"
+    assert cleaned[0][0]["text"] == "✅ Выбран"
+
+
+def test_bgorig_restores_the_original_and_removes_the_cleaned_file(env):
+    _seed_background(
+        env,
+        {
+            "id": 6,
+            "name": "Полка",
+            "path": "backgrounds/6_clean.jpg",
+            "original_path": "backgrounds/6.jpg",
+            "cleaned_at": "2026-10-31T10:00:00Z",
+        },
+    )
+    store.update_user(ALLOWED, {"background_id": 6})
+    _post(env["client"], _callback("bgorig:6"))
+
+    item = store.list_backgrounds()[0]
+    assert item == {"id": 6, "name": "Полка", "path": "backgrounds/6.jpg"}
+    assert (env["tmp_path"] / "backgrounds" / "6.jpg").exists()
+    assert not (env["tmp_path"] / "backgrounds" / "6_clean.jpg").exists()
+    edit = [m for m in env["sent"] if m["kind"] == "edit"][-1]
+    assert "Оригинал возвращён" in edit["args"][2]
+    keyboard = edit["kwargs"]["reply_markup"]["inline_keyboard"]
+    assert keyboard[0][0]["text"] == "✅ Выбран"
+    assert keyboard[1][0]["callback_data"] == "bgclean:6"  # can be cleaned again
+
+
+def test_bgorig_on_a_never_cleaned_background_is_an_alert(env):
+    _seed_background(env, {"id": 5, "name": "Стол", "path": "backgrounds/5.jpg"})
+    _post(env["client"], _callback("bgorig:5"))
+    answer = [m for m in env["sent"] if m["kind"] == "answer"][-1]
+    assert "оригинальная версия" in answer["args"][1]
+    assert store.list_backgrounds()[0]["path"] == "backgrounds/5.jpg"
+
+
+def test_product_after_cleaning_uses_the_cleaned_file(env):
+    _seed_background(
+        env,
+        {"id": 6, "name": "Полка", "path": "backgrounds/6_clean.jpg", "original_path": "backgrounds/6.jpg"},
+    )
+    store.update_user(ALLOWED, {"background_id": 6})
+    _post(env["client"], _photo(file_id="PRODUCT"))
+    assert env["dispatched"][0]["background"] == "backgrounds/6_clean.jpg"
+    assert env["dispatched"][0].get("task", "replace") == "replace"

@@ -272,3 +272,258 @@ def test_parse_args_defaults():
 def test_parse_args_requires_chat_and_file():
     with pytest.raises(SystemExit):
         worker.parse_args(["--chat-id", "1"])
+
+
+# --- one-off bookkeeping after delivery ------------------------------------
+
+
+@pytest.fixture()
+def settings_store(tmp_path, monkeypatch):
+    """worker._forget_oneoff builds a GithubStore(prefer_local=False); swap in
+    a LocalStore rooted at tmp_path so the read-modify-write is real."""
+    from common import config, store
+
+    monkeypatch.setattr(config, "GITHUB_TOKEN", "T")
+    local = store.LocalStore(tmp_path)
+    monkeypatch.setattr(store, "GithubStore", lambda **kw: local)
+    return local
+
+
+def test_worker_clears_oneoff_after_successful_delivery(
+    tmp_path, monkeypatch, fake_rembg, stub_telegram, settings_store
+):
+    from common import store
+
+    store.update_user(111, {"oneoff": "ONEOFF_BG", "model": "isnet-general-use"}, settings_store)
+    assert worker.main(_argv(tmp_path, None, oneoff_file_id="ONEOFF_BG")) == 0
+    assert stub_telegram[-1]["filename"] == "product.jpg"
+    assert store.user_settings(111, store.load_settings(settings_store))["oneoff"] is None
+
+
+def test_worker_keeps_a_newer_oneoff_set_meanwhile(
+    tmp_path, monkeypatch, fake_rembg, stub_telegram, settings_store
+):
+    from common import store
+
+    # While this job ran, the user already registered a different one-off.
+    store.update_user(111, {"oneoff": "NEWER_BG"}, settings_store)
+    assert worker.main(_argv(tmp_path, None, oneoff_file_id="ONEOFF_BG")) == 0
+    assert store.user_settings(111, store.load_settings(settings_store))["oneoff"] == "NEWER_BG"
+
+
+def test_worker_does_not_clear_oneoff_when_delivery_failed(
+    tmp_path, monkeypatch, fake_rembg, stub_telegram, settings_store
+):
+    from common import store
+
+    def boom(*a, **k):
+        raise tg.TelegramError("sendDocument", 500, "down")
+
+    monkeypatch.setattr(tg, "send_document", boom)
+    store.update_user(111, {"oneoff": "ONEOFF_BG"}, settings_store)
+    assert worker.main(_argv(tmp_path, None, oneoff_file_id="ONEOFF_BG")) == 1
+    assert store.user_settings(111, store.load_settings(settings_store))["oneoff"] == "ONEOFF_BG"
+
+
+def test_worker_bookkeeping_failure_does_not_fail_the_job(
+    tmp_path, monkeypatch, fake_rembg, stub_telegram
+):
+    from common import config, store
+
+    monkeypatch.setattr(config, "GITHUB_TOKEN", "T")
+
+    def boom(**kw):
+        raise store.StoreError("PUT settings.json: HTTP 500")
+
+    monkeypatch.setattr(store, "GithubStore", boom)
+    # The result was delivered; a failed clean-up must not turn that into a red run.
+    assert worker.main(_argv(tmp_path, None, oneoff_file_id="ONEOFF_BG")) == 0
+    assert stub_telegram[-1]["filename"] == "product.jpg"
+
+
+def test_worker_skips_bookkeeping_without_token(tmp_path, monkeypatch, fake_rembg, stub_telegram):
+    from common import config, store
+
+    monkeypatch.setattr(config, "GITHUB_TOKEN", "")
+    calls = []
+    monkeypatch.setattr(store, "GithubStore", lambda **kw: calls.append(kw))
+    assert worker.main(_argv(tmp_path, None, oneoff_file_id="ONEOFF_BG")) == 0
+    assert calls == []
+
+
+# --- task: clean ------------------------------------------------------------
+
+
+def _clean_argv(**kw):
+    argv = [
+        "--task", "clean",
+        "--chat-id", "555",
+        "--user-id", "111",
+        "--background", "backgrounds/7_marble.jpg",
+        "--background-id", "7",
+        "--model", "isnet-general-use",
+        "--label", "Мрамор",
+    ]
+    for key, value in kw.items():
+        flag = f"--{key.replace('_', '-')}"
+        if isinstance(value, bool):
+            if value:
+                argv.append(flag)
+        else:
+            argv += [flag, str(value)]
+    return argv
+
+
+def _busy_background(size=(600, 400)) -> Image.Image:
+    img = Image.new("RGB", size, (200, 190, 180))
+    img.paste(Image.new("RGB", (120, 160), (20, 20, 20)), (380, 120))  # a "vase"
+    return img
+
+
+@pytest.fixture()
+def clean_env(monkeypatch, tmp_path):
+    """A library with one background on disk and in the index, a LocalStore in
+    place of GithubStore and an rembg stub whose mask is the dark rectangle."""
+    from common import config, store
+
+    repo = config.REPO_DIR
+    (repo / "backgrounds").mkdir(parents=True, exist_ok=True)
+    _busy_background().save(repo / "backgrounds" / "7_marble.jpg", format="JPEG", quality=95)
+    local = store.LocalStore(repo)
+    store.save_backgrounds(
+        [{"id": 7, "path": "backgrounds/7_marble.jpg", "name": "Мрамор"}], local
+    )
+    monkeypatch.setattr(config, "GITHUB_TOKEN", "T")
+    monkeypatch.setattr(config, "INPAINT_BACKEND", "opencv")
+    monkeypatch.setattr(store, "GithubStore", lambda **kw: local)
+
+    state = {"mask_box": (380, 120, 499, 279)}
+
+    def remove(image, session=None, only_mask=False, **kw):
+        assert only_mask
+        mask = Image.new("L", image.size, 0)
+        if state["mask_box"]:
+            from PIL import ImageDraw
+
+            ImageDraw.Draw(mask).rectangle(state["mask_box"], fill=255)
+        return mask
+
+    module = types.ModuleType("rembg")
+    module.new_session = lambda model: model
+    module.remove = remove
+    monkeypatch.setitem(sys.modules, "rembg", module)
+    return {"store": local, "repo": repo, "state": state}
+
+
+@pytest.fixture()
+def stub_photo(monkeypatch, stub_telegram):
+    monkeypatch.setattr(
+        tg,
+        "send_photo",
+        lambda chat_id, blob, caption=None, reply_markup=None: stub_telegram.append(
+            {"chat_id": chat_id, "photo": blob, "caption": caption, "reply_markup": reply_markup}
+        ),
+    )
+    return stub_telegram
+
+
+def test_clean_task_stores_cleaned_copy_and_keeps_original(clean_env, stub_photo):
+    from common import store
+
+    assert worker.main(_clean_argv()) == 0
+
+    items = store.list_backgrounds(clean_env["store"])
+    item = items[0]
+    assert item["path"] == "backgrounds/7_marble_clean.jpg"
+    assert item["original_path"] == "backgrounds/7_marble.jpg"
+    assert item["cleaned_at"].endswith("Z")
+    assert (clean_env["repo"] / "backgrounds" / "7_marble.jpg").exists()  # original untouched
+    cleaned = Image.open(clean_env["repo"] / "backgrounds" / "7_marble_clean.jpg")
+    assert cleaned.size == (600, 400)
+    assert all(c > 120 for c in cleaned.getpixel((440, 200)))  # the dark vase is gone
+
+    msg = stub_photo[-1]
+    assert msg["chat_id"] == "555"
+    assert "очищен" in msg["caption"] and "Мрамор" in msg["caption"]
+    assert "OpenCV" in msg["caption"]
+    assert msg["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "bgorig:7"
+    assert Image.open(io.BytesIO(msg["photo"])).format == "JPEG"
+
+
+def test_clean_task_twice_does_not_nest_suffixes_or_lose_original(clean_env, stub_photo):
+    from common import store
+
+    assert worker.main(_clean_argv()) == 0
+    # Second pass starts from the already-cleaned file (that is what the bot passes).
+    assert worker.main(_clean_argv(background="backgrounds/7_marble_clean.jpg")) == 0
+    item = store.list_backgrounds(clean_env["store"])[0]
+    assert item["path"] == "backgrounds/7_marble_clean.jpg"
+    assert item["original_path"] == "backgrounds/7_marble.jpg"
+
+
+def test_clean_task_reports_nothing_to_clean(clean_env, stub_photo):
+    from common import store
+
+    clean_env["state"]["mask_box"] = None
+    assert worker.main(_clean_argv()) == 0
+    assert "не нашлось объектов" in stub_photo[-1]["text"]
+    assert "original_path" not in store.list_backgrounds(clean_env["store"])[0]
+
+
+def test_clean_task_refuses_when_mask_covers_most_of_the_frame(clean_env, stub_photo):
+    clean_env["state"]["mask_box"] = (0, 0, 599, 330)
+    assert worker.main(_clean_argv()) == 1
+    assert "Не стал очищать" in stub_photo[-1]["text"]
+
+
+def test_clean_task_reports_missing_background(clean_env, stub_photo):
+    assert worker.main(_clean_argv(background="backgrounds/nope.jpg")) == 1
+    assert "not found" in stub_photo[-1]["text"]
+
+
+def test_clean_task_dry_run_writes_file(clean_env, stub_photo, tmp_path):
+    from common import store
+
+    out = tmp_path / "c.jpg"
+    assert worker.main(_clean_argv(dry_run=True, out=str(out))) == 0
+    assert Image.open(out).size == (600, 400)
+    assert "original_path" not in store.list_backgrounds(clean_env["store"])[0]
+    assert stub_photo == []
+
+
+def test_clean_task_reports_store_failure(clean_env, stub_photo, monkeypatch):
+    from common import store
+
+    def boom(**kw):
+        raise store.StoreError("PUT: HTTP 500")
+
+    monkeypatch.setattr(store, "GithubStore", boom)
+    assert worker.main(_clean_argv()) == 1
+    assert "не смог сохранить" in stub_photo[-1]["text"]
+
+
+def test_clean_task_survives_unexpected_error(clean_env, stub_photo, monkeypatch):
+    from common import inpaint
+
+    def boom(*a, **k):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(inpaint, "object_mask", boom)
+    assert worker.main(_clean_argv()) == 1
+    assert "внутренняя ошибка" in stub_photo[-1]["text"]
+
+
+def test_parse_args_clean_requires_background_and_id():
+    with pytest.raises(SystemExit):
+        worker.parse_args(["--task", "clean", "--chat-id", "1", "--background", "b"])
+    with pytest.raises(SystemExit):
+        worker.parse_args(["--task", "clean", "--chat-id", "1", "--background-id", "3"])
+    args = worker.parse_args(
+        ["--task", "clean", "--chat-id", "1", "--background", "b", "--background-id", "3"]
+    )
+    assert args.task == "clean" and args.file_id == ""
+
+
+def test_parse_args_replace_still_requires_file_id():
+    with pytest.raises(SystemExit):
+        worker.parse_args(["--task", "replace", "--chat-id", "1", "--background", "b"])

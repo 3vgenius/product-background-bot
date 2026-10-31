@@ -150,4 +150,8 @@ def normalize_background(raw: bytes, max_side: int = 3000) -> bytes:
     """
     image = load_image(raw, max_pixels=config.MAX_BACKGROUND_PIXELS)
     image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
-    return encode_png(image.convert("RGB"))
+    # JPEG, not PNG: backgrounds are photographs, and a 3000 px PNG weighs
+    # 10-15 MB - slow to base64 through the Contents API on a 0.1-CPU dyno and
+    # heavy to pull back for every gallery preview. Transparency is flattened
+    # to white by encode_jpeg; a background has no use for alpha anyway.
+    return encode_jpeg(image, quality=config.BACKGROUND_JPEG_QUALITY)

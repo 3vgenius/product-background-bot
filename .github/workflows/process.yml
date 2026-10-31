@@ -8,13 +8,22 @@ name: Background replacement
 on:
   workflow_dispatch:
     inputs:
+      task:
+        description: "replace = product onto background; clean = remove objects from a background"
+        required: false
+        default: 'replace'
+      background_id:
+        description: "Library id of the background (for task=clean)"
+        required: false
+        default: ''
       chat_id:
         description: 'Telegram chat to send the result to'
         required: true
         type: string
       file_id:
         description: 'Telegram file_id of the product photo'
-        required: true
+        required: false
+        default: ''
         type: string
       user_id:
         description: 'Telegram user id (for logging)'
@@ -53,10 +62,15 @@ concurrency:
   group: background-${{ github.event.inputs.chat_id }}
   cancel-in-progress: false
 
+# contents: write is needed for exactly one thing: after a successful delivery
+# the worker clears the user's one-off background in settings.json.
+permissions:
+  contents: write
+
 jobs:
   replace:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -83,22 +97,50 @@ jobs:
           restore-keys: |
             rembg-model-
 
+      # LaMa (object removal) lives apart from the rembg models so that it gets
+      # its own fixed cache key: it never changes, so it is downloaded once.
+      - name: Cache LaMa model
+        if: github.event.inputs.task == 'clean'
+        uses: actions/cache@v4
+        with:
+          path: ~/.lama
+          key: lama-fp32-onnx-v1
+
       - name: Replace background
         env:
+          LAMA_HOME: /home/runner/.lama
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO: ${{ github.repository }}
           # 2 threads matches the runner's vCPU count; more threads on 2 cores
           # just adds contention.
           OMP_NUM_THREADS: '2'
+          # Inputs go through the environment, never inline in the script:
+          # ${{ }} is substituted into the shell text before it runs, so a
+          # background named  Лето "у моря"  would break the command and a
+          # name containing $(...) would execute on the runner.
+          IN_TASK: ${{ github.event.inputs.task }}
+          IN_BACKGROUND_ID: ${{ github.event.inputs.background_id }}
+          IN_CHAT_ID: ${{ github.event.inputs.chat_id }}
+          IN_USER_ID: ${{ github.event.inputs.user_id }}
+          IN_FILE_ID: ${{ github.event.inputs.file_id }}
+          IN_BACKGROUND: ${{ github.event.inputs.background }}
+          IN_ONEOFF_FILE_ID: ${{ github.event.inputs.oneoff_file_id }}
+          IN_MODEL: ${{ github.event.inputs.model }}
+          IN_SIZE: ${{ github.event.inputs.size }}
+          IN_LABEL: ${{ github.event.inputs.label }}
         run: |
           python worker.py \
-            --chat-id "${{ github.event.inputs.chat_id }}" \
-            --user-id "${{ github.event.inputs.user_id }}" \
-            --file-id "${{ github.event.inputs.file_id }}" \
-            --background "${{ github.event.inputs.background }}" \
-            --oneoff-file-id "${{ github.event.inputs.oneoff_file_id }}" \
-            --model "${{ github.event.inputs.model }}" \
-            --size "${{ github.event.inputs.size }}" \
-            --label "${{ github.event.inputs.label }}"
+            --task "${IN_TASK:-replace}" \
+            --background-id "$IN_BACKGROUND_ID" \
+            --chat-id "$IN_CHAT_ID" \
+            --user-id "$IN_USER_ID" \
+            --file-id "$IN_FILE_ID" \
+            --background "$IN_BACKGROUND" \
+            --oneoff-file-id "$IN_ONEOFF_FILE_ID" \
+            --model "$IN_MODEL" \
+            --size "$IN_SIZE" \
+            --label "$IN_LABEL"
 
       # worker.py already reports expected failures to the user, so this only
       # fires on infrastructure problems (bad secret, runner out of minutes...).
@@ -106,12 +148,14 @@ jobs:
         if: failure()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          IN_CHAT_ID: ${{ github.event.inputs.chat_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python - <<'PY'
           import os
           from common import telegram_api as tg
-          chat_id = "${{ github.event.inputs.chat_id }}"
-          run_url = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          chat_id = os.environ["IN_CHAT_ID"]
+          run_url = os.environ["RUN_URL"]
           try:
               tg.send_message(chat_id, f"⚠️ Обработка упала на уровне инфраструктуры.\nЛоги: {run_url}")
           except Exception as exc:

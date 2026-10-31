@@ -156,17 +156,35 @@ def edit_message(
         )
         return
     except TelegramError as exc:
+        if _not_modified(exc):
+            # Same text and keyboard as before (e.g. the user tapped the option
+            # that was already selected). Nothing to do, not an error.
+            return
         log.info("editMessageText failed (%s), retrying as caption", exc)
-    call(
-        "editMessageCaption",
-        {
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "caption": text,
-            "reply_markup": reply_markup,
-        },
-        timeout=15,
-    )
+    try:
+        call(
+            "editMessageCaption",
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "caption": text,
+                "reply_markup": reply_markup,
+            },
+            timeout=15,
+        )
+    except TelegramError as exc:
+        if _not_modified(exc):
+            return
+        raise
+
+
+def _not_modified(exc: TelegramError) -> bool:
+    return "message is not modified" in str(exc).lower()
+
+
+def set_my_commands(commands: list[dict]) -> None:
+    """Populate the "/" menu in Telegram clients."""
+    call("setMyCommands", {"commands": commands}, timeout=15)
 
 
 def download_by_file_id(file_id: str) -> bytes:
