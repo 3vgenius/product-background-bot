@@ -2,7 +2,7 @@
   "users": {
     "1314348241": {
       "background_id": null,
-      "model": "isnet-general-use",
+      "model": "birefnet-general",
       "size": 1024,
       "pending": null,
       "oneoff": null,
