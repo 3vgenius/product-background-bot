@@ -19,11 +19,11 @@ log = logging.getLogger(__name__)
 HELP_TEXT = (
     "Я заменяю фон на фотографиях товаров.\n\n"
     "Как пользоваться:\n"
-    "1. /bg — отправьте вместе с этим сообщением картинку фона, она попадёт в общую библиотеку\n"
+    "1. /bg — затем пришлите картинку фона (или сразу картинку с подписью /bg), она попадёт в общую библиотеку\n"
     "2. /backgrounds — посмотреть библиотеку и выбрать фон себе\n"
     "3. Просто пришлите фото товара — я вырежу его и поставлю на выбранный фон\n\n"
     "Другие команды:\n"
-    "/once — разовый фон (пришлите картинку фона вместе с командой), сработает на следующее фото товара\n"
+    "/once — разовый фон: затем пришлите картинку фона, она сработает только на следующее фото товара\n"
     "/settings — качество вырезания и размер результата\n"
     "/cancel — сбросить незавершённый сценарий\n\n"
     "Вырезание считается на GitHub Actions, поэтому результат приходит примерно через минуту. "
@@ -126,7 +126,9 @@ def add_background(user_id: int, file_id: str, name: str = "") -> dict:
     }
     items.append(item)
     store.save_backgrounds(items, message=f"background {background_id} added")
-    store.update_user(user_id, {"background_id": background_id, "pending": None})
+    store.update_user(
+        user_id, {"background_id": background_id, "pending": None, "pending_name": None}
+    )
     return item
 
 
@@ -252,8 +254,11 @@ def process_product(chat_id: int, user_id: int, file_id: str) -> None:
         if not item:
             tg.send_message(
                 chat_id,
-                "Сначала выберите фон: /backgrounds, добавьте свой через /bg "
-                "или задайте разовый через /once.",
+                "Фон ещё не выбран, поэтому это фото я не обрабатывал.\n\n"
+                "Сделайте одно из трёх и пришлите фото товара ещё раз:\n"
+                "• /bg — затем отправьте картинку фона (она сохранится в библиотеку)\n"
+                "• /backgrounds — выбрать из уже сохранённых\n"
+                "• /once — затем картинку фона, только для одного следующего фото",
             )
             return
         background_path = item["path"]
@@ -316,7 +321,7 @@ def handle_message(message: dict) -> None:
         return
 
     if command == "cancel":
-        store.update_user(user_id, {"pending": None, "oneoff": None})
+        store.update_user(user_id, {"pending": None, "pending_name": None, "oneoff": None})
         tg.send_message(chat_id, "Сбросил незавершённый сценарий и разовый фон.")
         return
 
@@ -330,17 +335,15 @@ def handle_message(message: dict) -> None:
 
     if command == "bg" or command == "add_background":
         if image is None:
-            if command == "bg":
-                tg.send_message(
-                    chat_id,
-                    "Пришлите картинку фона вместе с командой /bg "
-                    "(подпись к фото или файл с этой подписью).",
-                )
-                return
-            store.update_user(user_id, {"pending": "add_background"})
+            # Remember the intent: on a phone it is far easier to send the
+            # command first and the picture second than to type a caption.
+            # Without this, the follow-up picture was treated as a product
+            # photo and the user was told to "add a background via /bg" - a loop.
+            store.update_user(user_id, {"pending": "add_background", "pending_name": rest[:60]})
             tg.send_message(
                 chat_id,
-                "Отправьте следующее изображение — оно станет общим фоном. Отмена: /cancel.",
+                "Жду картинку фона — пришлите её следующим сообщением (фото или файл). "
+                "Она попадёт в общую библиотеку и сразу станет вашим фоном. Отмена: /cancel.",
             )
             return
         try:
@@ -381,12 +384,18 @@ def handle_message(message: dict) -> None:
         return
 
     if pending == "add_background":
+        # A caption on the picture itself wins over the name given with /bg.
+        name = text or str(entry.get("pending_name") or "")
         try:
-            item = add_background(user_id, image["file_id"], "")
+            item = add_background(user_id, image["file_id"], name)
         except (tg.TelegramError, ValueError) as exc:
             tg.send_message(chat_id, f"Не получилось добавить фон: {exc}")
             return
-        tg.send_message(chat_id, f"✅ Фон №{item['id']} добавлен и выбран для вас.")
+        tg.send_message(
+            chat_id,
+            f"✅ Фон №{item['id']} «{item['name']}» добавлен в общую библиотеку и выбран для вас. "
+            "Теперь пришлите фото товара.",
+        )
         return
 
     if pending == "once":

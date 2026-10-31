@@ -8,7 +8,10 @@ handling and the store writes are all genuinely executed.
 
 from __future__ import annotations
 
+import itertools
 import json
+import threading
+import time
 
 import pytest
 
@@ -17,6 +20,7 @@ from common import actions, config, store, telegram_api as tg
 ALLOWED = 111
 OUTSIDER = 999
 CHAT = 555
+_update_ids = itertools.count(1000)
 
 
 @pytest.fixture()
@@ -51,6 +55,7 @@ def env(tmp_path, monkeypatch):
     import app as app_module
 
     app_module.app.config["TESTING"] = True
+    app_module._seen.clear()
     return {
         "client": app_module.app.test_client(),
         "sent": sent,
@@ -71,7 +76,7 @@ def _message(text=None, user_id=ALLOWED, chat_id=CHAT, **extra):
     if text is not None:
         message["text"] = text
     message.update(extra)
-    return {"update_id": 1, "message": message}
+    return {"update_id": next(_update_ids), "message": message}
 
 
 def _photo(user_id=ALLOWED, chat_id=CHAT, caption=None, file_id="PROD"):
@@ -86,12 +91,12 @@ def _photo(user_id=ALLOWED, chat_id=CHAT, caption=None, file_id="PROD"):
     }
     if caption is not None:
         message["caption"] = caption
-    return {"update_id": 2, "message": message}
+    return {"update_id": next(_update_ids), "message": message}
 
 
 def _callback(data, user_id=ALLOWED):
     return {
-        "update_id": 3,
+        "update_id": next(_update_ids),
         "callback_query": {
             "id": "cb1",
             "from": {"id": user_id},
@@ -229,9 +234,21 @@ def test_cancel_clears_pending_state(env):
     assert entry["oneoff"] is None
 
 
-def test_bg_without_image_explains_usage(env):
+def test_bg_without_image_waits_for_the_next_picture(env):
+    """Regression: /bg alone used to only print usage and remember nothing, so
+    the picture sent next was treated as a product photo and the user was told
+    to add a background via /bg - an endless loop on a phone."""
     _post(env["client"], _message("/bg"))
-    assert "вместе с командой /bg" in env["sent"][0]["text"]
+    entry = store.user_settings(ALLOWED, store.load_settings())
+    assert entry["pending"] == "add_background"
+    assert "следующим сообщением" in env["sent"][0]["text"]
+
+
+def test_bg_with_name_remembers_it_for_the_next_picture(env):
+    _post(env["client"], _message("/bg Мрамор"))
+    entry = store.user_settings(ALLOWED, store.load_settings())
+    assert entry["pending"] == "add_background"
+    assert entry["pending_name"] == "Мрамор"
 
 
 def test_once_without_image_sets_pending(env):
@@ -252,7 +269,8 @@ def test_once_with_image_stores_oneoff(env):
 def test_product_photo_without_background_is_not_dispatched(env):
     _post(env["client"], _photo())
     assert env["dispatched"] == []
-    assert "Сначала выберите фон" in env["sent"][0]["text"]
+    assert "Фон ещё не выбран" in env["sent"][0]["text"]
+    assert "/bg" in env["sent"][0]["text"]
 
 
 def test_product_photo_dispatches_with_settings(env):
@@ -542,3 +560,173 @@ def test_error_reply_failure_does_not_escape(env, monkeypatch):
     monkeypatch.setattr(tg, "send_message", dead_api)
     resp = _post(env["client"], _message("/once"))
     assert resp.status_code == 200
+
+
+# --- adding a background: the full path, not just the pending flag ---------
+
+
+def _png_bytes(w=900, h=600, color=(10, 20, 200)):
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (w, h), color).save(buf, "PNG")
+    return buf.getvalue()
+
+
+@pytest.fixture()
+def fake_download(monkeypatch):
+    """Serve a real PNG for any file_id; records what was asked for."""
+    asked: list[str] = []
+
+    def download(file_id):
+        asked.append(file_id)
+        return _png_bytes()
+
+    monkeypatch.setattr(tg, "download_by_file_id", download)
+    return asked
+
+
+def test_bg_then_picture_adds_background_and_selects_it(env, fake_download):
+    _post(env["client"], _message("/bg Мрамор"))
+    _post(env["client"], _photo(file_id="BGFILE"))
+
+    assert fake_download == ["BGFILE"]
+    items = store.list_backgrounds()
+    assert len(items) == 1
+    item = items[0]
+    assert item["id"] == 1
+    assert item["name"] == "Мрамор"
+    assert item["added_by"] == ALLOWED
+    assert (env["tmp_path"] / item["path"]).is_file()
+    assert (env["tmp_path"] / item["path"]).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+    entry = store.user_settings(ALLOWED, store.load_settings())
+    assert entry["background_id"] == 1
+    assert entry["pending"] is None
+    assert entry["pending_name"] is None
+
+    confirmation = env["sent"][-1]["text"]
+    assert "Фон №1" in confirmation and "Мрамор" in confirmation
+    assert env["dispatched"] == []  # the background picture is not a product
+
+
+def test_picture_with_bg_caption_still_works(env, fake_download):
+    """The old one-message form must keep working for people who knew it."""
+    _post(env["client"], _photo(caption="/bg Дерево", file_id="BGFILE"))
+    items = store.list_backgrounds()
+    assert [i["name"] for i in items] == ["Дерево"]
+    assert store.user_settings(ALLOWED, store.load_settings())["background_id"] == 1
+
+
+def test_caption_on_the_picture_overrides_name_from_bg(env, fake_download):
+    _post(env["client"], _message("/bg Старое"))
+    _post(env["client"], _photo(caption="Новое", file_id="BGFILE"))
+    assert [i["name"] for i in store.list_backgrounds()] == ["Новое"]
+
+
+def test_product_photo_after_bg_flow_is_dispatched_with_that_background(env, fake_download):
+    _post(env["client"], _message("/bg"))
+    _post(env["client"], _photo(file_id="BGFILE"))
+    _post(env["client"], _photo(file_id="PRODUCT"))
+
+    assert len(env["dispatched"]) == 1
+    job = env["dispatched"][0]
+    assert job["file_id"] == "PRODUCT"
+    assert job["background"] == store.list_backgrounds()[0]["path"]
+    assert job["oneoff_file_id"] == ""
+    assert job["label"] == "Фон 1"
+    assert "Принял" in env["sent"][-1]["text"]
+
+
+def test_bg_flow_reports_unreadable_picture(env, monkeypatch):
+    monkeypatch.setattr(tg, "download_by_file_id", lambda fid: b"not an image at all")
+    _post(env["client"], _message("/bg"))
+    _post(env["client"], _photo(file_id="BAD"))
+    assert store.list_backgrounds() == []
+    assert "Не получилось добавить фон" in env["sent"][-1]["text"]
+    # The intent is kept so the user can simply send another picture.
+    assert store.user_settings(ALLOWED, store.load_settings())["pending"] == "add_background"
+
+
+def test_cancel_clears_bg_intent(env):
+    _post(env["client"], _message("/bg Имя"))
+    _post(env["client"], _message("/cancel"))
+    entry = store.user_settings(ALLOWED, store.load_settings())
+    assert entry["pending"] is None
+    assert entry["pending_name"] is None
+
+
+# --- redelivery and background processing ----------------------------------
+
+
+def test_duplicate_delivery_is_ignored(env):
+    """Telegram redelivers an update when it did not get a timely 2xx. The
+    second copy must not produce a second reply (or a second Actions run)."""
+    update = _message("/start")
+    assert _post(env["client"], update).status_code == 200
+    assert _post(env["client"], update).status_code == 200
+    assert len(env["sent"]) == 1
+
+
+def test_duplicate_product_photo_is_dispatched_once(env):
+    items = store.list_backgrounds()
+    items.append({"id": 3, "name": "Мрамор", "path": "backgrounds/3.png"})
+    store.save_backgrounds(items)
+    store.update_user(ALLOWED, {"background_id": 3})
+    update = _photo(file_id="PRODUCT")
+    _post(env["client"], update)
+    _post(env["client"], update)
+    assert len(env["dispatched"]) == 1
+
+
+def test_updates_without_id_are_never_deduplicated(env):
+    upd = _message("/start")
+    del upd["update_id"]
+    _post(env["client"], upd)
+    _post(env["client"], upd)
+    assert len(env["sent"]) == 2
+
+
+def test_seen_cache_is_bounded(env):
+    import app as app_module
+
+    for i in range(app_module._SEEN_LIMIT + 50):
+        app_module._already_seen(10_000_000 + i)
+    assert len(app_module._seen) == app_module._SEEN_LIMIT
+    # The newest id is still known...
+    assert app_module._already_seen(10_000_000 + app_module._SEEN_LIMIT + 49) is True
+    # ...and the oldest was evicted, so it reads as new again.
+    assert 10_000_000 not in app_module._seen
+    assert app_module._already_seen(10_000_000) is False
+
+
+def test_outside_testing_mode_handler_runs_in_background(env, monkeypatch):
+    """In production the POST returns before the handler finishes, so a slow
+    /bg cannot make Telegram time out and redeliver."""
+    import app as app_module
+
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def slow_handler(update):
+        started.set()
+        release.wait(5)
+        finished.set()
+
+    monkeypatch.setattr(app_module, "handle_update", slow_handler)
+    app_module.app.config["TESTING"] = False
+    try:
+        t0 = time.monotonic()
+        resp = _post(env["client"], _message("/start"))
+        elapsed = time.monotonic() - t0
+    finally:
+        app_module.app.config["TESTING"] = True
+    assert resp.status_code == 200
+    assert elapsed < 1.0, "request must not wait for the handler"
+    assert started.wait(2)
+    assert not finished.is_set()
+    release.set()
+    assert finished.wait(2)
