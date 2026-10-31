@@ -4,8 +4,8 @@
       "background_id": null,
       "model": "isnet-general-use",
       "size": 1024,
-      "pending": "once",
-      "oneoff": null
+      "pending": null,
+      "oneoff": "AgACAgIAAxkBAAMkauXeO9FfbveeQTDlRUrePe6MFlkAAtkcaxtwmTFLqrrh7kXyipsBAAMCAAN5AAM9BA"
     }
   }
 }
